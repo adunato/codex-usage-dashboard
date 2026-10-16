@@ -1,159 +1,239 @@
-# Codex Session Analysis — Design and Implementation Plan
+# Codex Session Analysis — Functional Specification and Build Plan
 
-**Status:** Proposed design for implementation  
 **Repository:** `adunato/codex-usage-dashboard`  
-**Reference agent configuration:** `adunato/codex-config`, branch `change/flat-agent-routing`  
-**Purpose:** Replace and simplify the existing dashboard as needed; its current design is not a constraint.
+**Target:** Replace/simplify the existing dashboard where useful; do not preserve unwanted UI or design decisions.  
+**Reference configuration:** `adunato/codex-config`, branch `change/flat-agent-routing` (for role names only).  
+**Status:** Design, not implemented.
 
-## 1. Goal
+## 1. What we are building
 
-Build a local application that answers two questions about a selected Codex session:
+A local web application for investigating an existing Codex conversation. The user selects a conversation and sees **(1) where its tokens were spent** and **(2) the actual events recorded while it ran**.
 
-1. **Where did the tokens go?** Show the session total and break it down by agent role, individual agent, and model.
-2. **What happened in the session?** Show the execution history that Codex actually recorded, so we can later decide what qualitative analysis is possible.
+The first working version must do both. It does **not** judge whether agents worked efficiently: we will decide how to do that only after seeing real session histories.
 
-The first version must provide **both** capabilities in a working browser application. It is **not** an AI efficiency auditor. No recommendations about `AGENTS.md` or agent behaviour are generated yet.
+### Typical use
 
-## 2. User-facing application
+1. Start the application using the existing `codex-usage-dashboard` skill/launcher.
+2. Find a conversation in the session list, e.g. “Fix authentication timeout”.
+3. Click it. The **Usage** tab shows total tokens, totals for Main/Explorer/Worker/etc., and totals for Luna/Sol/any other recorded model.
+4. Click **Inspect**. The page shows how many messages, tool calls, tool results, reasoning summaries, etc. were recorded, followed by a chronological list of those events.
+5. Select “Explorer” to see what the explorer did; expand a tool call to see its arguments and returned output. If the log contains no readable thinking, the screen says so rather than implying it is available.
 
-Keep a simple, English-only local web application, opened using the existing Codex skill or launcher.
+## 2. Exact screens and behaviours
 
-### A. Session selection
+### Screen A — Sessions
 
-Display a searchable list of sessions with title, project, date, and token total. Include archived sessions. Selecting a **root session** includes Main and all its associated subagents. Show a warning when a parent or linked thread is missing.
+A searchable list/table with **Title | Project | Date | Total tokens**. Display one selectable entry per *root conversation*, rather than forcing the user to select an individual agent thread.
 
-The selected session stays selected when switching between **Usage** and **Inspect**.
+- Sorting: newest first by default; click Total tokens to sort by consumption.
+- Clicking a conversation opens Screen B. Its associated subagents are included automatically.
+- Archived conversations are selectable.
+- If the selected conversation has missing/unreadable child logs, show a visible warning. Do not silently treat missing usage as zero.
+- An imported remote-device *summary* can show token data, but **Inspect** must say “Full session history not available on this device” unless its original logs exist locally.
 
-### B. Usage
+**Current-code starting point:** `CodexUsageAnalyzer.iter_session_files()` finds local logs; `build_snapshot()` produces the session list; the existing browser functions `agentTaskKey()` / `taskGroupsForRows()` already group threads into tasks. Reuse or replace the presentation, not the relationship data.
 
-Show three summaries for the selected root session:
+### Screen B — Usage
 
-**Overall:** input tokens, cached input tokens, output tokens, and total tokens.
+Header: **conversation title**, date, project, number of identified agents, and a clear **Complete / Incomplete** accounting status.
 
-**By agent:** one row per *role* (Main, Explorer, Designer, Worker, Worker Sol, Reviewer, Debugger, Validator, or Unknown), summing all agent instances of that role. Expanding a row reveals each individual agent/thread, its model(s), and token counts.
+Immediately below it show:
+```text
+Session usage
+Total 43,000   Input 36,000   Cached input 8,000   Output 7,000
+```
+Cached input is part of input, not additional consumption. Reasoning-output tokens are part of output.
 
-**By model:** one row per actual model identifier, summing its usage across Main and all subagents. If one agent switched models, split its consumption across those models.
+**Table 1 — By agent role**, expandable:
+```text
+Role             Agents   Input   Cached input   Output   Total
+Main                  1   14,000         4,000    3,000  17,000
+Explorer              2   12,000         1,000    1,500  13,500  ▸
+Worker Sol            1   10,000         3,000    2,500  12,500
+TOTAL                 4   36,000         8,000    7,000  43,000
+```
+Clicking the Explorer row opens two underlying explorer-thread rows, each with its recorded model and its own usage. List only roles actually used. The roles supported by the current config include Main, Explorer, Designer, Worker, Worker Sol, Validator, Reviewer and Debugger; show Unknown for an unidentifiable historical role.
 
-Use the same four numerical columns in both tables: **Input | Cached input | Output | Total**. Show a final total row.
+**Table 2 — By model**:
+```text
+Model               Input   Cached input   Output   Total
+gpt-6.1-sol        24,000         7,000    5,500  29,500
+gpt-6-luna         12,000         1,000    1,500  13,500
+TOTAL              36,000         8,000    7,000  43,000
+```
+These are **illustrative numbers only**, not measured sessions. Their purpose is to specify layout and reconciliation: both tables add up to the same 43,000 tokens. If an agent used two models, distribute its recorded consumption between the two model rows.
 
-**Important token definitions:** cached input is part of input, not an additional amount; reasoning-output tokens are part of output, not additional output. Therefore total is input + output. Reasoning-output tokens can appear in a detail view if recorded.
+No new pricing/cost system, charts, efficiency score, or benchmarks are in scope.
 
-For fully attributable sessions, the agent rows and model rows must each sum to the session total. Put unidentified roles or models in an **Unknown** row. If some token usage cannot be reliably counted at all, show a *known subtotal* and a clear **Incomplete** warning; never silently label it a complete total.
+**Accounting displayed to the user:**
+- “Complete” means all usage present in the inspected logs was counted and attributed; it is *not* a guarantee that Codex logged every internal request.
+- “Incomplete” means there is missing source data, unresolved duplicate/inherited usage, or an unresolvable accounting inconsistency. Show the known amount and an explanation; never label a partial amount as a verified full total.
+- If tokens are known but a role or model cannot be identified, include those amounts under Unknown. Their presence alone must not discard known usage.
 
-Do not introduce cost estimates, scoring, charts, or extra metrics for this version. Existing dashboard features unrelated to these needs need not be retained.
+### Screen C — Inspect
 
-### C. Inspect
+This is an **event browser**, not an AI interpretation of what happened.
 
-Show two sections for the same selected session:
+It shows two sections:
 
-**Recorded data:** counts of the event categories found (messages, reasoning records, tool calls, tool results, model/context changes, lifecycle events, and unrecognised events). Explicitly show which kinds of content are available, missing, unreadable, or encrypted.
+**1. “What the log contains”**
 
-**Timeline:** recorded events from Main and subagents in timestamp order, with filters for agent and event category. Each row shows time, agent, event type, and a brief preview. Expanding it displays the available recorded content and source-file/record reference.
+Example:
+```text
+Messages           18    Readable
+Tool calls         26    Readable
+Tool results       25    Readable (1 unmatched)
+Reasoning records   9    4 readable summaries, 5 encrypted/unavailable
+Agent threads       4    1 Main, 2 Explorer, 1 Worker Sol
+Other events       37    View types
+```
+Counts come from actual records, not estimates. This example is illustrative. Unknown event types remain listed, with their raw type names and counts.
 
-The inspector should expose, where present:
-- User and assistant messages, without confusing injected context with user prompts.
-- Readable reasoning summaries. Mark encrypted or missing reasoning as unavailable; never claim to recover hidden reasoning.
-- Tool names, recorded arguments, outputs/errors, and call identifiers.
-- Agent/thread identities, parent-child relationships, and recorded delegation activity.
-- Recorded patch/edit commands and their results. These are evidence of actions, **not** proof of the final Git repository state.
-- Other recorded events, including unknown event types, so their existence is visible.
+**2. “Session timeline”**
 
-Match a tool result to its invocation by recorded call ID when possible, not simply by neighbouring timestamps. Mark unmatched calls and outputs. For concurrent agents, chronological display does not imply causal order.
+Example of what a user sees:
+```text
+09:10:03  Main         Message          “Investigate the timeout...”
+09:10:07  Main         Tool call        spawn_agent → explorer
+09:10:10  Explorer #1  Tool call        read repository file
+09:10:11  Explorer #1  Tool result      42 lines returned       ▸
+09:10:16  Explorer #1  Reasoning        Summary available       ▸
+09:10:30  Explorer #1  Message          “The timeout occurs in...” ▸
+09:10:34  Worker Sol   Tool call        apply patch            ▸
+09:10:38  Worker Sol   Tool result      Patch applied          ▸
+09:10:45  Main         Message          “Implemented and tested...”
+```
+These are **examples of display**, not claims that every Codex recording contains these exact actions or event names.
 
-Large messages and tool outputs may be collapsed and loaded only when opened. Render all recorded text safely as text, not executable HTML.
+**User interactions:**
+- Filter timeline to **All agents** or one specific agent instance; filter event category (Messages, Tools, Reasoning, Other).
+- Click a row to expand the actual available content: full message text, tool name/arguments, tool output/error, or readable reasoning summary.
+- Display source reference (thread/session ID, original JSONL filename, and line/record position) with expanded content.
+- Clearly show **Content unavailable**, **Encrypted reasoning**, **Unmatched tool result**, or **Unknown event type** where applicable.
+- Display events by timestamp across threads; preserve per-file order when timestamps match. Do not imply causal relationships merely from timestamp order.
+- Very large outputs should be initially collapsed and loaded when the row is opened; no truncation without a visible indication.
 
-## 3. Data handling and accounting
+**Not promised:** access to hidden model thinking, reconstruction of the final Git diff from logs alone, or inference of actions Codex did not record.
 
-The source is the user's existing local Codex session history: `.codex/sessions`, `.codex/archived_sessions`, and relevant session index information. Use the dashboard's existing source discovery, including its Windows/WSL support.
+## 3. How the existing code will change
 
-**Use one shared JSONL reading mechanism.** Different parts of the application consume the fields they need. Session lists should not unnecessarily retain large tool outputs; opening a session or event makes its recorded content available. There is no requirement for two separate parsers or formal reading modes.
+Most functionality exists in one approximately 7,260-line file:
+`skills/codex-usage-dashboard/scripts/codex_usage_dashboard.py`.
 
-### Session identity
+The table below identifies the specific existing code and the required modification.
 
-Use the recorded source, thread/session IDs and parent relationships to associate Main with its subagents. A thread is counted once within a selected root session. Historical role assignments come from the session records when available, **not** from assuming the current agent configuration was used historically.
+| Existing code | What it currently does | Required change |
+| --- | --- | --- |
+| `iter_session_files()`, `load_session_titles()` | Locates rollout files and titles | Keep; expose a root-conversation list with local child threads |
+| `parse_file()` | Extracts metadata, selected messages, token events, tool counts | Keep usage extraction; ensure role/model identity and usage records needed for analysis are retained |
+| `normalize_subagent_usage()` | Removes inherited parent usage from child histories | Reuse and test; unresolved baselines become visible warnings |
+| `timeline_rows_with_deltas()` | Derives consumption from cumulative token counters | Reuse for model-specific token attribution; don't count cumulative snapshots as independent usage |
+| `build_snapshot()` | Assembles summaries and details | Add one root-session analysis result: overall, by role, by instance, by model, warnings |
+| `build_summary_static()` | Groups all-session totals; currently assigns each session to its latest model | **Do not use its `by_model` result for this screen**; split individual token contributions by their effective model |
+| `read_rollout_jsonl()` / `fast_ignored_rollout_projection()` | Skips large reasoning and tool-output payloads for fast reporting | Keep efficient parsing for lists, but make source records accessible for Inspect; do not rely on these projections for expanded content |
+| `make_handler()` | Serves `/api/sessions`, `/api/session`, etc. | Add one endpoint for selected-root usage and one for event timeline/details |
+| `HTML` and embedded JavaScript | Present multilingual/project-heavy existing UI | Replace with the three screens described above; English only |
+| `open_dashboard.py`, `bin/install.js` | Launch/install the current application | Keep working with the redesigned UI |
+| `tests/test_codex_usage_dashboard.py` | Contains tests for accounting, cache, model changes, fork handling | Retain relevant tests and extend them for new outputs |
 
-### Token usage
+**Design decision:** One shared JSONL file reader and one underlying usage calculation. The application parses only the fields it needs for the session list; when an event is expanded it retrieves the original record. No two-parser architecture, new backend framework, or mandated wholesale code rewrite.
 
-Build on the existing and tested code for token normalisation, usage deltas, fork-aware inherited-history removal, model changes, and cached parsing. Relevant starting points in the current Python file are `CodexUsageAnalyzer.parse_file`, `normalize_subagent_usage`, `timeline_rows_with_deltas`, `build_snapshot`, and `get_detail`.
+The developer may move code into smaller modules as necessary, but should not do a broad refactor merely to fit a speculative architecture.
 
-Rules:
-1. Interpret cumulative token counters as differences between snapshots, not by summing snapshots.
-2. Do not double-count a child's inherited parent token history, or repeated records from resumed/forked sessions.
-3. Associate each contribution with the effective recorded model at that point, including mid-session model changes.
-4. Codex log formats can evolve. Inspect the actual records encountered during implementation. If both per-response and cumulative usage records are present, reconcile overlapping usage rather than counting both. Do not assume unverified event fields exist.
-5. Preserve uncertainty: unrecognised usage, missing parent baselines, missing model identity, and contradictory counters are reported rather than guessed.
+## 4. Exact data behaviour
 
-Where a model is known but the agent role is not, its usage still contributes to the model table and the Unknown agent row. The inverse also applies.
+### Root conversation and agents
 
-### Recorded event inspection
+Use the recorded IDs and parent links: `session_id`, `root_session_id`, `parent_thread_id`, `forked_from_id`, and `agent_role` where present. Main is the root thread. Each child instance is listed once.
 
-The current usage parser intentionally skips some large reasoning and tool-output payloads for performance. Those events must be accessible in the inspector. Reuse the JSONL parsing foundation and read the original records as needed, instead of trying to reconstruct full content from the dashboard's short message previews.
+Historical sessions may have different agent roles than the current configuration. Do not infer roles from today's TOML files. Unknown stays Unknown.
 
-An inspected event retains a stable reference to its source file and position, so the UI can open the corresponding original record. If the underlying file changes, invalidate that reference and refresh the session rather than returning a different event.
+### Tokens
 
-The inspector is descriptive: it must clearly distinguish *recorded facts* from unavailable information. No AI model is invoked by these features.
+Use the recorded `input_tokens`, `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and `total_tokens` where present.
 
-## 4. Implementation approach
+- Report **Input** as all input including its cached portion.
+- Report **Output** as all output including reasoning.
+- Report **Total** as Input + Output when the source counters support that identity; inconsistent counters trigger a warning.
+- Do not add Cached input or Reasoning a second time.
+- Attribute consumption to its **agent instance** and the **effective model at the time**.
+- If a session changes models, use per-event model labels/context rather than the last model name.
 
-Use the existing `adunato/codex-usage-dashboard` repository as the starting point. Reuse the parts that work, but simplify or replace the rest freely.
+The existing code recognises `event_msg` + `token_count` and model changes from `turn_context` / `thread_settings_applied`. During implementation, inspect the user's actual recent logs for any other token record format. If newer per-response records exist, add support and deduplicate against cumulative totals rather than summing both representations.
 
-The existing application is mostly in `skills/codex-usage-dashboard/scripts/codex_usage_dashboard.py`, with tests in `tests/test_codex_usage_dashboard.py`. Keep the Python local server and the existing skill-launch mechanism. A new frontend framework and a new repository are not necessary.
+Where the same parent usage is carried into child histories, exclude the inherited portion, using the existing tested fork logic. If missing files make this impossible, surface that failure.
 
-Keep the implementation straightforward:
-- Reuse/refactor existing session discovery and token-accounting functions.
-- Add grouping by role and by model, with explicit accounting warnings.
-- Add event extraction and a timeline view that reads full original records when requested.
-- Replace the present UI with a focused English-only **Sessions / Usage / Inspect** experience. Remove Chinese localisation and unwanted presentation complexity.
-- Extract code from the monolithic script into small modules **only where that helps maintainability while implementing these features**; there is no mandated full rewrite or speculative architecture.
+### Events
 
-The browser interface and any command-line tests should use the same underlying calculations so totals cannot disagree.
+For each selected conversation, read the available records from its Main and child JSONL files. The event data needed by the UI is:
 
-Keep the service on `127.0.0.1` by default. The browser must select from discovered sessions/events; it must not be allowed to request arbitrary filesystem paths. Do not automatically upload session contents or publish private logs.
+```json
+{
+  "event_id": "opaque identifier",
+  "timestamp": "recorded ISO timestamp",
+  "thread_id": "source thread ID",
+  "agent": "Explorer #1",
+  "category": "tool_call",
+  "raw_type": "response_item/function_call",
+  "preview": "read repository file",
+  "source": {"file": "rollout-...jsonl", "line": 42},
+  "content_status": "readable"
+}
+```
 
-## 5. Implementation sequence
+This is the app's **proposed output structure**, not a claim about Codex's native JSONL schema. Expanding `event_id` retrieves the recorded payload from the original file.
 
-This is a delivery plan, **not** a separate research project.
+Recognise recorded message, reasoning, tool-call, tool-result, context and lifecycle types. List unknown variants under their raw type. Associate call/result pairs using recorded call IDs, never by adjacency alone. Report unmatched entries. Do not display encrypted reasoning as readable text.
 
-### Milestone 1 — Working first version
+**Security:** Read local session files only. Display user-supplied/log text as escaped plain text, not HTML. Never allow an API request to name an arbitrary filesystem path. Bind the local server to `127.0.0.1`. Do not send session data to an AI model or remote service automatically.
 
-Implement, in the existing project:
-1. Session selection with Main and associated subagents.
-2. Working session, role, individual-agent, and model token totals, using existing accounting logic.
-3. A basic inspector that reads actual session records and displays an event inventory and chronological, expandable timeline.
-4. A simplified English-only interface connecting those features.
+## 5. Build and verification — concrete deliverables
 
-**Deliverable:** A usable application that can select a real session, show both token breakdowns, and inspect its recorded events.
+### Delivery 1: Working application (the first actual implementation)
 
-**During this implementation**, examine representative local JSONL records to identify supported fields and variations. This is part of making the first version work, **not** a preceding deliverable or a standalone format-discovery phase. Unknown formats must be marked unsupported until handled.
+Modify the existing app, not just a design or log inventory.
 
-### Milestone 2 — Accuracy and completeness
+**Developer tasks:**
+1. Use the current `build_snapshot()` / session grouping data to present one selectable row per root conversation.
+2. Build a backend aggregation function returning overall, by-role, by-agent and by-model token totals for the selected root conversation.
+3. Connect those totals to the Usage screen, including expansion of role rows.
+4. Read original JSONL event records for that conversation and return an event inventory and a timestamp-ordered list with expandable details.
+5. Connect those events to the Inspect screen.
+6. Run the revised application against local session logs while developing it; use actual encountered records to implement and correct parsing.
 
-Test against representative real sessions: an ordinary session, a multi-agent session, an archived/resumed session, and a model-switching session if available. Resolve accounting discrepancies and fill in observed event types.
+**Demonstration required to accept Delivery 1:**
+- Open the existing launcher and select one multi-agent conversation.
+- Show numerical totals for Main and participating subagents, grouped by role.
+- Show model totals for the same conversation.
+- Click Inspect, filter to one agent, expand a message and an actual tool call/result, and show the original recorded content or an explicit unavailable status.
+- Explain any fields that the selected logs do not actually contain.
 
-Add or adapt automated tests for inherited token history, duplicate records, mixed usage formats, model switches, unavailable attribution, tool call/result matching, encrypted reasoning, unknown events, and malformed/large records.
+This is a complete usable vertical slice. Unsupported log variants may still be clearly flagged for Delivery 2; the UI must not invent data for them.
 
-**Deliverable:** Consistent totals for supported formats, with explicit warnings for remaining gaps; a useful event timeline for the inspected samples.
+### Delivery 2: Make it reliable across recorded sessions
 
-### Milestone 3 — Cleanup and release
+Run the app against several representative sessions (single-agent, multi-agent, archived/resumed, model-switching if available). Extend the parser for variants actually encountered.
 
-Remove unnecessary UI/localisation code, tidy modules affected by the work, preserve the installer and launcher, update documentation, and run the full regression suite and Windows launch check.
+**Tests must verify:**
+- For the numerical example in section 2, Main 17,000 + Explorer 13,500 + Worker Sol 12,500 = **43,000**; model rows 29,500 + 13,500 = **43,000**.
+- If two Explorers share a role, their totals aggregate under Explorer but remain independently expandable.
+- If one agent switches models, its tokens are split across model rows.
+- Inherited fork counters, repeated records and cumulative snapshots are not double-counted.
+- Cached input and reasoning output are not added twice.
+- Missing metadata is visible as Unknown or Incomplete as appropriate.
+- Timeline results preserve source references; recorded tool calls and results pair by ID, even when interleaved.
+- Unknown records, encrypted reasoning and missing results are visible rather than fabricated.
 
-**Deliverable:** A maintainable, English-only application with the agreed features, not a partially rewritten dashboard with parallel interfaces.
+Use synthetic or sanitised fixtures in Git, not real private transcripts.
 
-## 6. Acceptance criteria
+### Delivery 3: Remove unnecessary complexity and finish
 
-The work is complete when all of the following hold:
+Remove Chinese-language UI and redundant interface code; complete only refactors needed by the changed features. Keep existing Python launcher and installer functioning on Windows, and run the current regression tests.
 
-1. A user can open the application and select a root session that includes its subagents.
-2. The Usage view shows the overall total, totals **by agent role**, expandable **individual agents**, and totals **by model**.
-3. The same underlying consumption is not counted twice, cached/reasoning tokens are treated as subsets, and totals reconcile when attribution is complete.
-4. Missing or uncertain consumption/attribution is explicitly marked instead of hidden.
-5. The Inspect view shows the observed event categories and an expandable chronology containing recorded messages, available reasoning summaries, tool activity, and other events.
-6. The inspector does not invent hidden reasoning, unrecorded file changes, or missing agent actions.
-7. The original Codex logs and configuration are not modified. Raw session contents stay local unless the user explicitly chooses to share them.
-8. The application is straightforward, English-only, and starts using the existing skill-launch workflow.
-9. Existing relevant tests remain passing, with new regression tests for the added functionality.
+Confirm source session files were not modified. Update the README to explain the three screens and documented limitations.
 
-## 7. Subsequent decision (not part of this implementation)
+**Final acceptance:** A local application where the user can select a conversation, understand exactly which agents and models spent its tokens, and browse the events Codex recorded. No AI scoring or behavioural recommendations yet.
 
-Once the inspector works, examine a few representative session histories and discuss which parts of agent behaviour can be reliably evaluated. **Only then** design a qualitative efficiency-analysis agent. Do not predefine an auditor or quality scores in this project phase.
+## 6. After this version
+
+Use the working Inspect screen to examine a few real sessions and agree what a separate qualitative evaluator could legitimately judge. That evaluator is **not** part of this design.
