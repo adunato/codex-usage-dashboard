@@ -14,6 +14,15 @@ A local browser for Codex conversations: find a root conversation, see where its
 
 **Complete** means all usage available in the inspected logs was counted and attributed. It does not guarantee that Codex recorded every internal request. **Incomplete** shows known totals with explanations for missing logs, unresolved inherited counters or inconsistent accounting. Unidentified historical roles and models appear as **Unknown**.
 
+## Windows: double-click to start and stop
+
+Open the `skills/codex-usage-dashboard` folder (or the installed skill folder) in File Explorer:
+
+- Double-click **Start Dashboard.bat** to start the local dashboard and open your browser.
+- Double-click **Stop Dashboard.bat** to stop dashboard servers. Running it again is safe.
+
+No terminal commands or open Codex app are needed. Closing the browser does not stop the server; use the Stop file. Both files find an installed Python 3 interpreter and show a readable error if it is unavailable.
+
 ## Install With The Skills CLI
 
 Recommended global Codex install:
