@@ -1,4 +1,5 @@
 import datetime as dt
+from contextlib import closing
 import http.client
 import importlib.util
 import json
@@ -393,7 +394,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             second = {"timestamp": "2026-07-10T10:01:00Z", "type": "world_state", "payload": {}}
             first_line = json.dumps(first, separators=(",", ":")) + "\n"
             second_line = json.dumps(second, separators=(",", ":")) + "\n"
-            path.write_text(first_line + second_line, encoding="utf-8")
+            path.write_bytes((first_line + second_line).encode("utf-8"))
             stats = dashboard.RolloutReadStats()
 
             rows = dashboard.read_rollout_jsonl(path, stats=stats)
@@ -1949,7 +1950,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             )
             first.scan("all")
             first.close()
-            with sqlite3.connect(cache_path) as connection:
+            with closing(sqlite3.connect(cache_path)) as connection:
                 connection.execute(
                     "UPDATE parsed_files SET parser_version = ?",
                     (dashboard.PARSE_CACHE_VERSION - 1,),
@@ -2067,7 +2068,7 @@ class CodexUsageDashboardTests(unittest.TestCase):
             )
             second.scan("all")
             second.close()
-            with sqlite3.connect(cache_path) as connection:
+            with closing(sqlite3.connect(cache_path)) as connection:
                 row_count = connection.execute("SELECT COUNT(*) FROM parsed_files").fetchone()[0]
 
         self.assertEqual(row_count, 0)
@@ -2427,107 +2428,15 @@ class CodexUsageDashboardTests(unittest.TestCase):
         self.assertTrue(result["needs_confirmation"])
         self.assertEqual(result["reason"], "current_device")
 
-    def test_html_defaults_to_project_grouped_view(self) -> None:
+    def test_html_serves_english_session_analysis_without_external_assets(self) -> None:
         html = dashboard.HTML
-        project_index = html.index('data-view-button="project"')
-        recent_index = html.index('data-view-button="recent"')
-        total_index = html.index('data-view-button="total"')
-
-        self.assertLess(project_index, recent_index)
-        self.assertLess(recent_index, total_index)
-        self.assertIn("viewMode: 'project'", html)
-        self.assertIn("const projectPreviewLimit = 5", html)
-        self.assertIn("function renderProjectTable()", html)
-        self.assertIn("function projectGroups()", html)
-        self.assertIn("function taskGroupsForRows(rows)", html)
-        self.assertIn("row.root_session_id", html)
-        self.assertIn("row.parent_thread_id", html)
-        self.assertIn("usage = addClientUsage(usage, usageOf(row));", html)
-        self.assertIn('data-task-toggle="${escapeHtml(task.key)}"', html)
-        self.assertIn("taskExpanded: {}", html)
-        self.assertIn("task-detail-summary", html)
-        self.assertIn("selectable: group.subagentCount === 0", html)
-        self.assertIn("sessionRowHtml(group.root, childClasses, options)", html)
-        self.assertIn("data-task-toggle-row", html)
-        self.assertIn("function toggleTaskGroup(key)", html)
-        self.assertIn(".project-session-row .title-cell {\n      padding-left: 34px;", html)
-        self.assertIn(".project-session-row.task-expandable-row .title-cell {\n      padding-left: 34px;", html)
-        self.assertIn(".project-session-row.task-child-row .title-cell {\n      padding-left: 74px;", html)
-        self.assertNotIn("mainAgent: '主 agent'", html)
-        self.assertIn(".project-session-row.task-child-row .title-cell", html)
-        self.assertNotIn("task-indent", html)
-        self.assertNotIn("taskAgentCount", html)
-        self.assertIn("function folderIcon()", html)
-        self.assertIn("function branchIcon()", html)
-        self.assertIn("function branchBadge(row)", html)
-        self.assertIn("return row.project_root || row.cwd", html)
-        self.assertIn("${branchIcon()}</span>", html)
-        self.assertNotIn("${branchIcon()}${escapeHtml(label)}</span>", html)
-        self.assertIn("compactProject", html)
-        self.assertIn("archivedDelta", html)
-        self.assertIn("function summarizeProjectRows(rows)", html)
-        self.assertIn('class="number project-aggregate-cell project-total-cell"', html)
-        self.assertIn('class="model-cell project-aggregate-cell"', html)
-        self.assertNotIn('<td class="project-summary-cell" colspan="6">', html)
-        self.assertIn("--project-summary: #2d5fa8;", html)
-        self.assertLess(html.index("${folderIcon()}"), html.index('<span class="project-name"'))
-        self.assertLess(html.index('<div class="project-title-cell">'), html.index("${environmentBadge(group)}"))
-        self.assertLess(html.index("${environmentBadge(group)}"), html.index('<div class="project-meta">'))
-        self.assertIn("git-worktree-project-grouping", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("effective-dated-pricing-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("expandable-agent-task-rollups-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("compact-agent-task-tree-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("aligned-agent-task-tree-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("main-agent-child-usage-row-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("aligned-task-title-gutter-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("project-session-indent-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("clickable-task-rows-and-gutter-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("main-agent-title-alignment-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("compact-subagent-indent-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("project-folder-aggregate-columns-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("filtered-summary-metrics-v1", dashboard.DASHBOARD_FEATURES)
-        self.assertIn("function summarizeFilteredSessions()", html)
-        self.assertIn("const summary = summarizeFilteredSessions();", html)
-        self.assertIn("const rows = baseFilteredSessions();", html)
-        self.assertNotIn("const usage = state.summary && state.summary.usage", html)
-        self.assertIn("function unitPriceTooltip(segments, usageKey, baseTitle = '')", html)
-        self.assertIn("function fmtUsdRate(value)", html)
-        self.assertIn("String.fromCharCode(10)", html)
-        self.assertIn('class="price-tooltip-trigger"', html)
-        self.assertIn('tabindex="0"', html)
-        self.assertIn("unitPriceSegment", html)
-        self.assertIn("cache_write_tokens", html)
-        self.assertIn("function loadDailyUsage()", html)
-        self.assertIn("/api/daily-usage", html)
-        self.assertIn("function fmtCalendarTokens(n)", html)
-        self.assertIn("fmtCalendarTokens(tokens)", html)
-        self.assertNotIn("escapeHtml(fmtCompact(tokens))", html)
-        self.assertIn("snapshotToken: ''", html)
-        self.assertIn("const nextSnapshotToken = data.snapshot_token || ''", html)
-        self.assertIn("state.snapshotToken = nextSnapshotToken", html)
-        self.assertIn("const requestedToken = state.snapshotToken", html)
-        self.assertIn("params.set('snapshot_token', requestedToken)", html)
-        self.assertIn("res.status === 409", html)
-        self.assertIn("state.snapshotToken !== requestedToken", html)
-        self.assertIn("void showDetails(first.uid)", html)
-
-    def test_html_shows_loading_animation_for_interactive_data_requests(self) -> None:
-        html = dashboard.HTML
-        overlay_start = html.index('<div class="loading-overlay" id="loadingOverlay"')
-        overlay_tag = html[overlay_start:html.index(">", overlay_start)]
-
-        self.assertNotIn(" hidden", overlay_tag)
-        self.assertNotIn("aria-busy", overlay_tag)
-        self.assertIn('role="status"', overlay_tag)
-        self.assertIn('aria-live="polite"', overlay_tag)
-        self.assertIn('<main id="dashboardMain" aria-busy="true">', html)
-        self.assertIn('class="loading-spinner"', html)
-        self.assertIn("@keyframes loading-spin", html)
-        self.assertIn(".loading-overlay[hidden]", html)
-        self.assertIn("function setLoadingIndicator(active, silent = false)", html)
-        self.assertIn("setLoadingIndicator(true, options.silent === true);", html)
-        self.assertIn("main.setAttribute('aria-busy', active ? 'true' : 'false');", html)
-        self.assertIn("setLoadingIndicator(false);", html)
+        for label in ("Sessions", "Usage", "Inspect", "What the log contains", "Session timeline"):
+            self.assertIn(label, html)
+        for route in ("sessions", "usage", "events", "event"):
+            self.assertIn("/api/analysis/" + route, html)
+        self.assertNotIn('<script src=', html)
+        self.assertNotIn('data-view-button="project"', html)
+        self.assertIn("session-analysis-v1", dashboard.DASHBOARD_FEATURES)
 
     def test_http_snapshot_token_serves_consistent_detail_and_rejects_stale_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2638,53 +2547,11 @@ class CodexUsageDashboardTests(unittest.TestCase):
             opener.urlopen = lambda *_args, **_kwargs: Response(dashboard.DASHBOARD_FEATURES)
             self.assertEqual(opener.health_dashboard_url(8765), "http://127.0.0.1:8765/")
             opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "effective-dated-pricing-v1"]
+                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "session-analysis-v1"]
             )
             self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "expandable-agent-task-rollups-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "compact-agent-task-tree-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "aligned-agent-task-tree-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "main-agent-child-usage-row-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "aligned-task-title-gutter-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "project-session-indent-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "clickable-task-rows-and-gutter-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "main-agent-title-alignment-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "compact-subagent-indent-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "project-folder-aggregate-columns-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
-            opener.urlopen = lambda *_args, **_kwargs: Response(
-                [feature for feature in dashboard.DASHBOARD_FEATURES if feature != "filtered-summary-metrics-v1"]
-            )
-            self.assertIsNone(opener.health_dashboard_url(8765))
+            opener.urlopen = lambda *_args, **_kwargs: Response(["session-analysis-v1"])
+            self.assertEqual(opener.health_dashboard_url(8765), "http://127.0.0.1:8765/")
         finally:
             opener.urlopen = original_urlopen
 

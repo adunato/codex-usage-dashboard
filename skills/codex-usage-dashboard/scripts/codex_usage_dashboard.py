@@ -12,10 +12,12 @@ It does not modify Codex files. Bind address defaults to 127.0.0.1.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import concurrent.futures
 import datetime as dt
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import platform
@@ -140,7 +142,7 @@ PERIOD_KEYS = {"today", "7d", "30d", "week", "month", "all"}
 APP_NAME = "cousash"
 SNAPSHOT_SCHEMA = "cousash.remote-snapshot"
 SNAPSHOT_VERSION = 1
-PARSE_CACHE_VERSION = 4
+PARSE_CACHE_VERSION = 6
 PARSE_CACHE_SAMPLE_BYTES = 4096
 DEFAULT_PARSE_WORKERS = min(4, max(1, os.cpu_count() or 2))
 DEFAULT_PARSE_MIN_FILES = 8
@@ -155,6 +157,7 @@ def environment_int(name: str, default: int) -> int:
 
 
 DASHBOARD_FEATURES = [
+    "session-analysis-v1",
     "periods",
     "period-deltas",
     "period-token-label",
@@ -317,8 +320,10 @@ def normalize_usage(value: Any) -> dict[str, int]:
             raw = value.get(key, 0)
             if key == "cache_write_tokens" and key not in value:
                 raw = value.get("cache_write_input_tokens", 0)
-            if isinstance(raw, (int, float)):
-                usage[key] = int(raw)
+            if isinstance(raw, int) and not isinstance(raw, bool):
+                usage[key] = max(raw, 0)
+            elif isinstance(raw, float) and math.isfinite(raw) and raw.is_integer():
+                usage[key] = max(int(raw), 0)
     return usage
 
 
@@ -1174,7 +1179,7 @@ class RolloutReadStats:
 
 
 def fast_ignored_rollout_projection(raw_line: bytes) -> dict[str, Any] | None:
-    if len(raw_line) < FAST_ROLLOUT_MIN_BYTES or not raw_line.endswith(b"}}\n"):
+    if len(raw_line) < FAST_ROLLOUT_MIN_BYTES or not raw_line.endswith((b"}}\n", b"}}\r\n")):
         return None
     match = FAST_ROLLOUT_HEADER.match(raw_line)
     if match is None:
@@ -1195,6 +1200,9 @@ def read_rollout_jsonl(
     start_offset: int = 0,
     stats: RolloutReadStats | None = None,
     end_offset: int | None = None,
+    *,
+    full_payload: bool = False,
+    with_source: bool = False,
 ) -> Iterator[dict[str, Any]]:
     stats = stats or RolloutReadStats()
     first_line = start_offset == 0
@@ -1204,18 +1212,24 @@ def read_rollout_jsonl(
         if start_offset:
             handle.seek(start_offset)
         remaining = max(0, end_offset - start_offset)
+        line_number = 0
         while remaining:
+            offset = handle.tell()
             raw_line = handle.readline(remaining)
+            line_number += 1
+            source = {"line": line_number, "offset": offset, "length": len(raw_line)}
             if not raw_line:
                 break
             remaining -= len(raw_line)
             complete_line = raw_line.endswith(b"\n")
-            projection = fast_ignored_rollout_projection(raw_line)
+            projection = None if full_payload else fast_ignored_rollout_projection(raw_line)
             if projection is not None:
                 stats.bytes_read += len(raw_line)
                 stats.fast_skipped_line_count += 1
                 stats.fast_skipped_bytes += len(raw_line)
                 first_line = False
+                if with_source:
+                    projection["_source"] = source
                 yield projection
                 continue
 
@@ -1232,10 +1246,12 @@ def read_rollout_jsonl(
                 if not complete_line:
                     return
                 stats.bytes_read += len(raw_line)
-                yield {"__parse_error__": True}
+                yield {"__parse_error__": True, **({"_source": source} if with_source else {})}
                 continue
             stats.bytes_read += len(raw_line)
             if isinstance(item, dict):
+                if with_source:
+                    item["_source"] = source
                 yield item
 
 
@@ -1462,6 +1478,20 @@ def path_state_signature(path: Path) -> tuple[str, int | None, int | None]:
 
 def file_stat_tuple(stat: os.stat_result) -> tuple[int, int, int, int]:
     return int(stat.st_dev), int(stat.st_ino), stat.st_mtime_ns, stat.st_size
+
+
+def sqlite_file_identity(value: int) -> int | str:
+    """Return an exact, SQLite-bindable representation of a file identity."""
+    normalized = int(value)
+    if -(1 << 63) <= normalized <= (1 << 63) - 1:
+        return normalized
+    return f"identity:{normalized}"
+
+
+def file_identity_from_sqlite(value: object) -> int:
+    if isinstance(value, str) and value.startswith("identity:"):
+        return int(value.removeprefix("identity:"))
+    return int(value)
 
 
 def file_change_requires_retry(
@@ -1935,8 +1965,8 @@ class PersistentParseCache:
                 return FileParseCacheEntry(
                     int(row[0]),
                     int(row[1]),
-                    int(row[2]),
-                    int(row[3]),
+                    file_identity_from_sqlite(row[2]),
+                    file_identity_from_sqlite(row[3]),
                     self.decode_payload(row[7]),
                     self.decode_payload(row[8]),
                     bool(row[4]),
@@ -1981,8 +2011,8 @@ class PersistentParseCache:
                     PARSE_CACHE_VERSION,
                     entry.mtime_ns,
                     entry.size,
-                    entry.device,
-                    entry.inode,
+                    sqlite_file_identity(entry.device),
+                    sqlite_file_identity(entry.inode),
                     int(entry.append_safe),
                     entry.prefix_digest,
                     entry.tail_digest,
@@ -2782,6 +2812,25 @@ class CodexUsageAnalyzer:
         for index, (log_source, _path, source) in enumerate(files):
             parsed = parsed_by_index.get(index)
             if parsed is None:
+                # Retain known identity/relationships even if the usage source is unreadable.
+                payload = self.cached_session_meta(_path)
+                sid = str(payload.get("id") or payload.get("session_id") or _path.stem)
+                raw_source = payload.get("source")
+                nested = raw_source.get("subagent", {}) if isinstance(raw_source, dict) else {}
+                nested = nested.get("thread_spawn", nested) if isinstance(nested, dict) else {}
+                parent = str(payload.get("parent_thread_id") or nested.get("parent_thread_id") or "")
+                detail = {"uid": self.analysis_id(log_source.id, sid), "session_id": sid,
+                          "root_session_id": str(payload.get("root_session_id") or sid),
+                          "parent_thread_id": parent,
+                          "forked_from_id": str(payload.get("forked_from_id") or nested.get("forked_from_id") or ""),
+                          "agent_role": str(payload.get("agent_role") or nested.get("agent_role") or ""),
+                          "is_subagent": bool(parent or nested),
+                          "title": "Unavailable session source", "environment_id": log_source.id,
+                          "codex_home": str(log_source.codex_home), "path": str(_path),
+                          "timeline": [], "total_token_usage": zero_usage(), "source": source,
+                          "source_unreadable": True,
+                          "accounting_warnings": [{"code": "source_unavailable", "message": "A discovered session log could not be read."}]}
+                details_by_uid[detail["uid"]] = detail
                 continue
             cached_summary, cached_detail = parsed
             summary = dict(cached_summary)
@@ -2852,7 +2901,212 @@ class CodexUsageAnalyzer:
             "daily_usage_complete": include_daily_usage,
             "period": {"key": "all", "start_at": None, "end_at": generated_at},
         }
+        snapshot["analysis"] = self.build_analysis(snapshot)
         return snapshot
+
+    @staticmethod
+    def analysis_id(environment_id: str, session_id: str) -> str:
+        return hashlib.sha256((environment_id + "\0" + session_id).encode("utf-8")).hexdigest()[:24]
+
+    def build_analysis(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        keys = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
+        def counters(value: Any) -> dict[str, int]:
+            normalized = normalize_usage(value)
+            return {k: normalized[k] for k in keys}
+        def combine(values: Any) -> dict[str, int]:
+            result = zero_usage()
+            for value in values:
+                result = add_usage(result, value)
+            return counters(result)
+        def warn(warnings: list, code: str, message: str, agent_id: str = "") -> None:
+            value = {"code": code, "message": message}
+            if agent_id:
+                value["agent_id"] = agent_id
+            if value not in warnings:
+                warnings.append(value)
+
+        # One instance per recorded thread; resumed/duplicate files do not create agents.
+        instances: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        analysis_details = {str(row.get("uid") or ""): dict(row) for row in snapshot["sessions"]}
+        for uid, detail in snapshot["details_by_uid"].items():
+            analysis_details[uid] = {**analysis_details.get(uid, {}), **detail}
+        for detail in analysis_details.values():
+            env = str(detail.get("environment_id") or "")
+            sid = str(detail.get("session_id") or detail.get("uid") or "")
+            instances.setdefault((env, sid), []).append(detail)
+        groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        root_problems: dict[tuple[str, str], str] = {}
+        for key, details in instances.items():
+            current = key
+            visited = set()
+            while current in instances:
+                if current in visited:
+                    root_problems[key] = "Recorded parent links form a cycle."
+                    current = min(visited)
+                    break
+                visited.add(current)
+                d = instances[current][0]
+                sid = current[1]
+                recorded_root = str(d.get("root_session_id") or "")
+                parent = str(d.get("parent_thread_id") or d.get("forked_from_id") or "")
+                explicit_root = recorded_root if recorded_root and recorded_root != sid else ""
+                target = parent if parent and (current[0], parent) in instances else explicit_root or parent
+                if not target:
+                    break
+                current = (current[0], target)
+            groups.setdefault(current, []).append(key)
+
+        roots = []
+        usages = {}
+        sources = {}
+        role_names = {"main": "Main", "explorer": "Explorer", "designer": "Designer", "worker": "Worker",
+                      "worker-sol": "Worker Sol", "worker_sol": "Worker Sol", "worker sol": "Worker Sol",
+                      "validator": "Validator", "reviewer": "Reviewer", "debugger": "Debugger"}
+        for root_key, member_keys in groups.items():
+            root_id = self.analysis_id(*root_key)
+            warnings: list[dict[str, Any]] = []
+            root_details = instances.get(root_key)
+            representative = (root_details or instances[member_keys[0]])[0]
+            if root_details is None:
+                warn(warnings, "missing_root", "The recorded parent/root session log is unavailable on this device.")
+            agents = []
+            thread_sources = []
+            for key in sorted(member_keys, key=lambda k: (k != root_key, k[1])):
+                details = instances[key]
+                d = details[0]
+                agent_id = self.analysis_id(*key)
+                is_main = key == root_key and not d.get("is_subagent")
+                recorded_role = str(d.get("agent_role") or "").strip()
+                role = "Main" if is_main else role_names.get(recorded_role.lower(), recorded_role or "Unknown")
+                if role == "Unknown":
+                    warn(warnings, "unknown_role", "An agent has no recorded role; its known usage is included under Unknown.", agent_id)
+                for detail in details:
+                    recorded_parent = str(detail.get("parent_thread_id") or "")
+                    if recorded_parent and (key[0], recorded_parent) not in instances:
+                        warn(warnings, "missing_parent", "A recorded parent agent has no available session log on this device.", agent_id)
+                    for warning in detail.get("accounting_warnings", []):
+                        warn(warnings, warning["code"], warning["message"], agent_id)
+                    if detail.get("parse_errors"):
+                        warn(warnings, "unreadable_records", "Some source records could not be parsed.", agent_id)
+                    if detail.get("fork_usage_resolved") is False and (detail.get("is_subagent") or detail.get("forked_from_id")):
+                        warn(warnings, "inherited_usage_unresolved", "Inherited usage could not be separated from this agent's counters.", agent_id)
+                    if key in root_problems:
+                        warn(warnings, "relationship_cycle", root_problems[key], agent_id)
+                # Union cumulative rows rather than adding resumed copies of the same thread.
+                rows = []
+                seen = set()
+                for detail in details:
+                    for row in detail.get("timeline", []):
+                        fingerprint = tuple(normalize_usage(row.get("total_token_usage")).values())
+                        if fingerprint not in seen:
+                            seen.add(fingerprint)
+                            rows.append(row)
+                if len(details) > 1:
+                    rows.sort(key=lambda row: str(row.get("timestamp") or ""))
+                    merged = []
+                    boundary = 0
+                    for row in rows:
+                        total = normalize_usage(row.get("total_token_usage"))["total_tokens"]
+                        if total < boundary:
+                            continue
+                        merged.append(row)
+                        boundary = total
+                    rows = merged
+                by_model: dict[str, dict[str, int]] = {}
+                for row, _at, _total, delta in timeline_rows_with_deltas(rows):
+                    model = str(row.get("model") or "Unknown")
+                    by_model[model] = add_usage(by_model.get(model, zero_usage()), delta)
+                if rows and any(parse_timestamp(row.get("timestamp")) is None for row in rows):
+                    attributed = combine(by_model.values())
+                    known = max(details, key=lambda item: normalize_usage(item.get("total_token_usage"))["total_tokens"])
+                    remainder = subtract_usage(normalize_usage(known.get("total_token_usage")), attributed)
+                    if usage_has_tokens(remainder):
+                        by_model["Unknown"] = add_usage(by_model.get("Unknown", zero_usage()), remainder)
+                    warn(warnings, "undated_usage", "Some usage has no usable timestamp; its known remainder is included under Unknown.", agent_id)
+                if len(details) > 1:
+                    warn(warnings, "duplicate_sources", "Multiple source files record this thread; overlapping histories are merged and require verification.", agent_id)
+                for detail in details:
+                    for child_id in detail.get("referenced_child_ids", []):
+                        if (key[0], child_id) not in instances:
+                            warn(warnings, "missing_child", "A recorded spawned agent has no available session log on this device.", agent_id)
+                if not rows:
+                    # Imported summaries may contain usage without full event histories.
+                    known = max(details, key=lambda item: normalize_usage(item.get("total_token_usage"))["total_tokens"])
+                    if usage_has_tokens(normalize_usage(known.get("total_token_usage"))):
+                        by_model["Unknown"] = normalize_usage(known.get("total_token_usage"))
+                        warn(warnings, "model_attribution_unavailable", "Usage is recorded without an attributable event timeline.", agent_id)
+                if "Unknown" in by_model and usage_has_tokens(by_model["Unknown"]):
+                    warn(warnings, "unknown_model", "Some known usage has no recorded effective model.", agent_id)
+                usage = combine(by_model.values())
+                parent = str(d.get("parent_thread_id") or d.get("forked_from_id") or "")
+                agent = {"id": agent_id, "session_id": key[1],
+                         "parent_id": self.analysis_id(key[0], parent) if parent else None,
+                         "role": role, "label": str(d.get("agent_nickname") or role),
+                         "models": [{"model": model, "usage": counters(value)} for model, value in sorted(by_model.items())],
+                         "usage": usage}
+                agents.append(agent)
+                if d.get("is_remote"):
+                    warn(warnings, "remote_history_unavailable", "Full session history not available on this device.", agent_id)
+                for detail in details:
+                    if detail.get("is_remote") or detail.get("source_unreadable"):
+                        continue
+                    path = Path(str(detail.get("path") or ""))
+                    source_root = Path(str(detail.get("codex_home") or self.codex_home)).resolve()
+                    try:
+                        path = path.resolve(strict=True)
+                        path.relative_to(source_root)
+                        if not path.is_file():
+                            raise OSError("missing source")
+                    except (OSError, ValueError):
+                        warn(warnings, "source_unavailable", "A recorded session source is unavailable.", agent_id)
+                        continue
+                    thread_sources.append({"agent_id": agent_id, "session_id": key[1], "role": role,
+                                           "label": agent["label"], "path": path, "source_root": source_root,
+                                           "size": detail.get("source_file_size", detail.get("file_size", 0)),
+                                           "mtime_ns": detail.get("source_mtime_ns", path.stat().st_mtime_ns),
+                                           **({"device": detail["source_device"]} if detail.get("source_device") is not None else {}),
+                                           **({"inode": detail["source_inode"]} if detail.get("source_inode") is not None else {})})
+            roles = []
+            for role in dict.fromkeys(a["role"] for a in agents):
+                members = [a for a in agents if a["role"] == role]
+                if len(members) > 1:
+                    for index, member in enumerate(members, 1):
+                        member["label"] = f"{member['label']} #{index}"
+                        for source in thread_sources:
+                            if source["agent_id"] == member["id"]:
+                                source["label"] = member["label"]
+                roles.append({"role": role, "usage": combine(a["usage"] for a in members), "agents": members})
+            models = {}
+            for agent in agents:
+                for model in agent["models"]:
+                    models.setdefault(model["model"], []).append(model["usage"])
+            overall = combine(a["usage"] for a in agents)
+            if overall["total_tokens"] != overall["input_tokens"] + overall["output_tokens"]:
+                warn(warnings, "inconsistent_counters", "Attributed token counters do not reconcile to input plus output; the recorded known counters are shown.")
+            if overall["cached_input_tokens"] > overall["input_tokens"] or overall["reasoning_output_tokens"] > overall["output_tokens"]:
+                warn(warnings, "inconsistent_subsets", "Attributed cached input or reasoning output exceeds its containing counter.")
+            incomplete = any(w["code"] not in {"unknown_role", "unknown_model"} for w in warnings)
+            root = {"id": root_id, "title": representative.get("title") or "Untitled conversation",
+                    "project": representative.get("project") or "", "date": representative.get("created_at") or representative.get("start_at") or "",
+                    "agent_count": len(agents), "usage": overall,
+                    "completeness": "incomplete" if incomplete else "complete", "warnings": warnings,
+                    "inspect_available": bool(thread_sources)}
+            roots.append(root)
+            usages[root_id] = {"root": root, "overall": overall, "by_role": roles, "by_agent": agents,
+                               "by_model": [{"model": model, "usage": combine(values)} for model, values in sorted(models.items())],
+                               "warnings": warnings}
+            sources[root_id] = thread_sources
+        roots.sort(key=lambda root: root["date"], reverse=True)
+        return {"roots": roots, "usages": usages, "sources": sources}
+
+    def analysis_snapshot(self, snapshot_token: str | None = None) -> dict[str, Any]:
+        if snapshot_token:
+            with self._published_lock:
+                snapshot = self._published_snapshots.get(snapshot_token)
+            if snapshot is None:
+                raise SnapshotStaleError(snapshot_token)
+            return snapshot
+        return self.scan("all")
 
     def filter_snapshot_by_period(
         self,
@@ -3116,6 +3370,7 @@ class CodexUsageAnalyzer:
         end_offset: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         log_source = log_source or self.codex_sources[0]
+        source_stat = path.stat()
         resolved_path = self.resolved_path_key(path)
         uid = hashlib.sha1(f"{log_source.id}:{resolved_path}".encode("utf-8", errors="replace")).hexdigest()[:16]
         base = base_detail or {}
@@ -3150,8 +3405,77 @@ class CodexUsageAnalyzer:
 
         total_usage = normalize_usage(base.get("total_token_usage"))
         last_usage = normalize_usage(base.get("last_token_usage"))
-        timeline = list(base.get("timeline", [])) if isinstance(base.get("timeline"), list) else []
+        timeline = list(base.get("_token_count_timeline", base.get("timeline", [])))
+        modern_usage_rows = list(base.get("_modern_usage_rows", []))
         tasks = list(base.get("tasks", [])) if isinstance(base.get("tasks"), list) else []
+        accounting_warnings = list(base.get("accounting_warnings", []))
+        response_usage_seen = dict(base.get("_response_usage_seen", {}))
+        spawn_call_ids = set(base.get("_spawn_call_ids", []))
+        referenced_child_ids = set(base.get("referenced_child_ids", []))
+
+        def note_spawn_result(value: Any) -> None:
+            if isinstance(value, str):
+                try:
+                    note_spawn_result(json.loads(value))
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(value, dict):
+                child_id = value.get("agent_id") or value.get("thread_id")
+                if isinstance(child_id, str) and child_id:
+                    referenced_child_ids.add(child_id)
+                for name in ("content", "text", "result", "output"):
+                    if name in value:
+                        note_spawn_result(value[name])
+            elif isinstance(value, list):
+                for child in value:
+                    note_spawn_result(child)
+        usage_families = set(base.get("_usage_families", []))
+
+        def accounting_warning(code: str, message: str) -> None:
+            if not any(w.get("code") == code for w in accounting_warnings):
+                accounting_warnings.append({"code": code, "message": message})
+
+        def checked_usage(value: Any, required: bool = True) -> tuple[dict[str, int], bool]:
+            normalized = normalize_usage(value)
+            recognized = False
+            malformed = False
+            if isinstance(value, dict):
+                for name in (*TOKEN_KEYS, "cache_write_input_tokens"):
+                    if name not in value:
+                        continue
+                    raw = value[name]
+                    valid = (isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0) or (
+                        isinstance(raw, float) and math.isfinite(raw) and raw >= 0 and raw.is_integer())
+                    recognized = recognized or valid
+                    malformed = malformed or not valid
+            if malformed or (required and not recognized):
+                accounting_warning("invalid_usage", "Some recorded token counters have an unsupported or invalid shape; only valid nonnegative counters are included.")
+            return normalized, recognized
+
+        def record_usage(cumulative: Any, last: Any, timestamp: Any, family: str,
+                         response_id: str = "", event_model: str | None = None) -> None:
+            nonlocal total_usage, last_usage, token_event_count
+            current, usable = checked_usage(cumulative)
+            if not usable:
+                accounting_warning("usage_unresolved", "A token record has no usable cumulative counters.")
+                return
+            previous = normalize_usage(timeline[-1].get("total_token_usage")) if timeline else zero_usage()
+            usage_families.add(family)
+            if current["total_tokens"] != current["input_tokens"] + current["output_tokens"]:
+                accounting_warning("inconsistent_counters", "Recorded total tokens differ from input plus output.")
+            if current["cached_input_tokens"] > current["input_tokens"] or current["reasoning_output_tokens"] > current["output_tokens"]:
+                accounting_warning("inconsistent_subsets", "Recorded cached input or reasoning output exceeds its containing counter.")
+            if timeline and current == previous:
+                return
+            if timeline and any(current[key] < previous[key] for key in TOKEN_KEYS):
+                accounting_warning("counter_reset", "Recorded cumulative counter components decrease; the accounting boundary is uncertain.")
+            total_usage = current
+            last_usage, _last_usable = checked_usage(last, required=last is not None)
+            token_event_count += 1
+            timeline.append({"timestamp": timestamp, "model": event_model if event_model is not None else model,
+                             "total_token_usage": current, "last_token_usage": last_usage,
+                             "model_context_window": model_context_window, "rate_limits": latest_rate_limits,
+                             "usage_family": family, "response_id": response_id})
         raw_tool_counts = base.get("tool_counts")
         tool_counts = {
             str(name): int(count)
@@ -3220,7 +3544,7 @@ class CodexUsageAnalyzer:
                 if not session_meta_seen:
                     session_meta_seen = True
                     session_id = str(payload.get("id") or payload.get("session_id") or session_id)
-                    root_session_id = str(payload.get("session_id") or session_id)
+                    root_session_id = str(payload.get("root_session_id") or payload.get("session_id") or session_id)
                     cwd = str(payload.get("cwd") or cwd)
                     created_at = str(payload.get("timestamp") or created_at)
                     originator = str(payload.get("originator") or originator)
@@ -3308,10 +3632,40 @@ class CodexUsageAnalyzer:
                 elif response_type == "function_call":
                     name = str(payload.get("name") or "function_call")
                     tool_counts[name] = tool_counts.get(name, 0) + 1
+                    if name.rsplit(".", 1)[-1] == "spawn_agent" and payload.get("call_id"):
+                        spawn_call_ids.add(str(payload["call_id"]))
+                elif response_type in {"function_call_output", "custom_tool_call_output"}:
+                    if str(payload.get("call_id") or "") in spawn_call_ids:
+                        note_spawn_result(payload.get("output"))
+
+            elif item_type == "token_usage_record":
+                response_id = str(payload.get("response_id") or "")
+                cumulative, cumulative_usable = checked_usage(payload.get("thread_token_usage"), required="thread_token_usage" in payload)
+                contribution, contribution_usable = checked_usage(payload.get("usage"))
+                if response_id and response_id in response_usage_seen:
+                    if response_usage_seen[response_id] != contribution:
+                        accounting_warning("response_conflict", "A repeated response ID has conflicting token counters.")
+                    continue
+                if response_id:
+                    response_usage_seen[response_id] = contribution
+                event_model = model_from_payload(payload) or model
+                if event_model and event_model not in models:
+                    models.append(event_model)
+                if not cumulative_usable and not (response_id and contribution_usable):
+                    accounting_warning("usage_unresolved", "A token record has neither usable cumulative counters nor a unique response contribution.")
+                else:
+                    modern_usage_rows.append({"timestamp": timestamp, "model": event_model,
+                        "total_token_usage": normalize_usage(cumulative), "last_token_usage": contribution,
+                        "response_only": not cumulative_usable,
+                        "usage_family": "token_usage_record", "response_id": response_id})
 
             elif item_type == "event_msg":
                 event_type = payload.get("type")
-                if event_type == "thread_settings_applied":
+                if event_type == "item_completed":
+                    completed = payload.get("item")
+                    if isinstance(completed, dict) and isinstance(completed.get("agent_thread_id"), str):
+                        referenced_child_ids.add(completed["agent_thread_id"])
+                elif event_type == "thread_settings_applied":
                     # Desktop/WSL model switches often arrive here before the next
                     # turn_context, so apply them immediately for timeline pricing.
                     note_model(model_from_payload(payload))
@@ -3335,25 +3689,17 @@ class CodexUsageAnalyzer:
                     latest_rate_limit_reached_type = reached if isinstance(reached, str) else latest_rate_limit_reached_type
 
                     info = payload.get("info")
+                    if not isinstance(info, dict):
+                        accounting_warning("invalid_usage", "A token-count record has no usable usage object.")
                     if isinstance(info, dict):
-                        token_event_count += 1
-                        # Prefer explicit model on the token event when present.
-                        note_model(model_from_payload(info) or model_from_payload(payload) or model)
-                        total_usage = normalize_usage(info.get("total_token_usage"))
-                        last_usage = normalize_usage(info.get("last_token_usage"))
+                        # Prefer explicit model at the usage event, never the final session model.
+                        event_model = model_from_payload(info) or model_from_payload(payload) or model
+                        if event_model and event_model not in models:
+                            models.append(event_model)
                         window = info.get("model_context_window")
                         if isinstance(window, (int, float)):
                             model_context_window = int(window)
-                        timeline.append(
-                            {
-                                "timestamp": timestamp,
-                                "model": model,
-                                "total_token_usage": total_usage,
-                                "last_token_usage": last_usage,
-                                "model_context_window": model_context_window,
-                                "rate_limits": latest_rate_limits,
-                            }
-                        )
+                        record_usage(info.get("total_token_usage"), info.get("last_token_usage"), timestamp, "token_count", event_model=event_model)
 
                 elif event_type == "task_complete":
                     duration = payload.get("duration_ms")
@@ -3388,6 +3734,54 @@ class CodexUsageAnalyzer:
                     message = payload.get("message") or payload.get("text") or payload.get("content")
                     if isinstance(message, str) and not first_user_prompt and not is_synthetic_user_context(message):
                         first_user_prompt = clean_text(message, 260)
+
+        token_count_timeline = list(timeline)
+        if modern_usage_rows:
+            if not timeline:
+                # Modern-only logs use their cumulative thread counters, never a sum of both representations.
+                timeline = []
+                for modern in modern_usage_rows:
+                    if modern.get("response_only"):
+                        previous = normalize_usage(timeline[-1]["total_token_usage"]) if timeline else zero_usage()
+                        modern = {**modern, "total_token_usage": add_usage(previous, modern["last_token_usage"])}
+                    current = normalize_usage(modern["total_token_usage"])
+                    if timeline and current["total_tokens"] < normalize_usage(timeline[-1]["total_token_usage"])["total_tokens"]:
+                        accounting_warning("counter_reset", "Recorded cumulative counters decrease; the accounting boundary is uncertain.")
+                    if not timeline or current != normalize_usage(timeline[-1]["total_token_usage"]):
+                        timeline.append(modern)
+            else:
+                # Older cumulative snapshots are authoritative wherever the two families overlap.
+                # A trailing modern record is included only when its response contribution proves
+                # that its cumulative counters start exactly at the current known boundary.
+                authority = list(timeline)
+                index = 0
+                for modern in modern_usage_rows:
+                    if modern.get("response_only"):
+                        accounting_warning("usage_overlap", "Response-only usage overlaps cumulative coverage and cannot be independently added.")
+                        continue
+                    at = str(modern.get("timestamp") or "")
+                    while index < len(authority) and str(authority[index].get("timestamp") or "") < at:
+                        index += 1
+                    current = normalize_usage(modern["total_token_usage"])
+                    if index < len(authority):
+                        if current != normalize_usage(authority[index]["total_token_usage"]):
+                            accounting_warning("usage_overlap", "Token record families disagree over overlapping coverage; cumulative token-count usage is shown.")
+                        continue
+                    boundary = normalize_usage(timeline[-1]["total_token_usage"])
+                    if current == boundary:
+                        continue
+                    contribution = normalize_usage(modern["last_token_usage"])
+                    if add_usage(boundary, contribution) == current:
+                        timeline.append(modern)
+                    else:
+                        accounting_warning("usage_overlap", "Trailing token records cannot be reconciled with the known cumulative boundary.")
+            for row in timeline:
+                value = normalize_usage(row.get("total_token_usage"))
+                if value["total_tokens"] != value["input_tokens"] + value["output_tokens"]:
+                    accounting_warning("inconsistent_counters", "Recorded total tokens differ from input plus output.")
+            total_usage = normalize_usage(timeline[-1].get("total_token_usage")) if timeline else zero_usage()
+            last_usage = normalize_usage(timeline[-1].get("last_token_usage")) if timeline else zero_usage()
+            token_event_count = len(timeline)
 
         fast_skipped_line_count += rollout_stats.fast_skipped_line_count
         fast_skipped_bytes += rollout_stats.fast_skipped_bytes
@@ -3451,6 +3845,10 @@ class CodexUsageAnalyzer:
             "codex_home": str(log_source.codex_home),
             "path": resolved_path,
             "file_size": start_offset + rollout_stats.bytes_read,
+            "source_file_size": end_offset if end_offset is not None else source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "source_device": int(source_stat.st_dev),
+            "source_inode": int(source_stat.st_ino),
             "line_count": line_count,
             "parse_errors": parse_errors,
             "fast_skipped_line_count": fast_skipped_line_count,
@@ -3498,6 +3896,13 @@ class CodexUsageAnalyzer:
             "time_to_first_token_ms_avg": int(sum(ttf_ms) / len(ttf_ms)) if ttf_ms else None,
             "timeline": timeline,
             "tasks": tasks,
+            "accounting_warnings": accounting_warnings,
+            "referenced_child_ids": sorted(referenced_child_ids),
+            "_spawn_call_ids": sorted(spawn_call_ids),
+            "_token_count_timeline": token_count_timeline,
+            "_modern_usage_rows": modern_usage_rows,
+            "_response_usage_seen": response_usage_seen,
+            "_usage_families": sorted(usage_families),
             "_turn_ids": sorted(turn_ids),
             "_session_meta_seen": session_meta_seen,
             "_raw_created_at": raw_created_at,
@@ -3624,3223 +4029,23 @@ class CodexUsageAnalyzer:
         return json.dumps(self.export_snapshot_payload(), ensure_ascii=False, indent=2)
 
 
-HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Usage Dashboard</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7f6;
-      --panel: #ffffff;
-      --line: #d9dfdd;
-      --text: #17201d;
-      --muted: #65716c;
-      --accent: #0f7b63;
-      --accent-2: #b85f18;
-      --accent-3: #2d5fa8;
-      --project-summary: #2d5fa8;
-      --danger: #b42318;
-      --soft: #edf4f1;
-      --shadow: 0 10px 30px rgba(26, 36, 32, 0.08);
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 14px;
-    }
-    body.data-loading {
-      overflow: hidden;
-    }
-    .loading-overlay[hidden] {
-      display: none;
-    }
-    .loading-overlay {
-      position: fixed;
-      inset: 0;
-      z-index: 60;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: rgba(245, 247, 246, 0.82);
-      backdrop-filter: blur(2px);
-    }
-    .loading-indicator {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-height: 48px;
-      padding: 10px 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255, 255, 255, 0.96);
-      box-shadow: var(--shadow);
-      color: var(--text);
-      font-weight: 650;
-    }
-    .loading-spinner {
-      width: 22px;
-      height: 22px;
-      flex: 0 0 22px;
-      border: 3px solid #c8d5d0;
-      border-top-color: var(--accent);
-      border-right-color: var(--accent-2);
-      border-radius: 50%;
-      animation: loading-spin 0.75s linear infinite;
-    }
-    @keyframes loading-spin {
-      to { transform: rotate(360deg); }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .loading-spinner { animation: none; }
-    }
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 5;
-      background: rgba(245, 247, 246, 0.94);
-      border-bottom: 1px solid var(--line);
-      backdrop-filter: blur(10px);
-    }
-    .header-inner {
-      max-width: 1480px;
-      margin: 0 auto;
-      padding: 18px 24px 14px;
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
-      align-items: center;
-      gap: 16px;
-    }
-    .brand {
-      min-width: 0;
-    }
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-    .subtitle {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 13px;
-      word-break: break-all;
-    }
-    .toolbar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      justify-self: end;
-    }
-    .period-wrap {
-      position: relative;
-      justify-self: center;
-    }
-    .period-toggle {
-      display: grid;
-      grid-template-columns: repeat(7, minmax(48px, 1fr));
-      gap: 3px;
-      min-height: 38px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      min-width: 458px;
-    }
-    .period-option {
-      min-height: 30px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 10px;
-      white-space: nowrap;
-    }
-    .period-option.active {
-      background: var(--accent);
-      color: #fff;
-      box-shadow: 0 1px 4px rgba(15, 123, 99, 0.22);
-    }
-    .calendar-popover {
-      position: absolute;
-      top: calc(100% + 8px);
-      left: 50%;
-      transform: translateX(-50%);
-      width: 360px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      box-shadow: 0 18px 40px rgba(26, 36, 32, 0.18);
-      z-index: 20;
-    }
-    .calendar-popover[hidden] {
-      display: none;
-    }
-    .modal-backdrop[hidden] {
-      display: none;
-    }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      z-index: 40;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: rgba(23, 32, 29, 0.36);
-    }
-    .modal {
-      width: min(720px, 100%);
-      max-height: min(720px, calc(100vh - 48px));
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      box-shadow: 0 20px 60px rgba(23, 32, 29, 0.22);
-    }
-    .modal-head,
-    .modal-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-    }
-    .modal-actions {
-      justify-content: flex-end;
-      border-top: 1px solid var(--line);
-      border-bottom: 0;
-    }
-    .modal-head h2 {
-      margin: 0;
-      font-size: 16px;
-      line-height: 1.3;
-    }
-    .modal-body {
-      padding: 16px;
-      display: grid;
-      gap: 12px;
-    }
-    .remote-table {
-      width: 100%;
-      min-width: 0;
-      table-layout: fixed;
-      font-size: 13px;
-    }
-    .remote-table th:nth-child(1) { width: 18%; }
-    .remote-table th:nth-child(2) { width: 18%; }
-    .remote-table th:nth-child(3) { width: 9%; }
-    .remote-table th:nth-child(4) { width: 15%; }
-    .remote-table th:nth-child(5) { width: 15%; }
-    .remote-table th:nth-child(6) { width: 25%; }
-    .remote-table th,
-    .remote-table td {
-      position: static;
-      padding: 8px;
-      vertical-align: middle;
-    }
-    .remote-table th {
-      text-align: left;
-    }
-    .remote-table .remote-count {
-      font-variant-numeric: tabular-nums;
-      text-align: left;
-      white-space: nowrap;
-    }
-    .remote-table .remote-date,
-    .remote-table .remote-code {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .remote-table .remote-action-cell {
-      text-align: right;
-    }
-    .remote-actions {
-      display: flex;
-      gap: 6px;
-      justify-content: flex-end;
-      flex-wrap: nowrap;
-      white-space: nowrap;
-    }
-    .remote-actions button {
-      min-height: 30px;
-      padding: 0 8px;
-    }
-    .inline-form {
-      display: grid;
-      gap: 8px;
-    }
-    .inline-form label {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .inline-form input {
-      width: 100%;
-      padding: 0 10px;
-    }
-    .status-line {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-    .status-line.error-text {
-      color: var(--danger);
-    }
-    .danger {
-      color: var(--danger);
-      border-color: #f1b4ae;
-      background: #fff7f6;
-    }
-    .calendar-head,
-    .calendar-actions {
-      display: grid;
-      grid-template-columns: 36px minmax(0, 1fr) 36px;
-      gap: 8px;
-      align-items: center;
-      margin-bottom: 10px;
-    }
-    .calendar-title {
-      text-align: center;
-      font-weight: 750;
-      font-size: 14px;
-    }
-    .calendar-actions {
-      grid-template-columns: 1fr 1fr;
-      margin: 10px 0 0;
-    }
-    .calendar-grid {
-      display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr));
-      gap: 4px;
-    }
-    .calendar-weekday {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-      text-align: center;
-      padding: 4px 0;
-    }
-    .calendar-day {
-      display: grid;
-      grid-template-rows: 16px 14px;
-      gap: 2px;
-      min-height: 42px;
-      padding: 4px 2px;
-      border-radius: 6px;
-      font-size: 12px;
-      line-height: 1;
-      text-align: center;
-    }
-    .calendar-day.outside {
-      color: #a3aca8;
-      background: #fbfcfc;
-    }
-    .calendar-day.in-range {
-      background: #eef8f4;
-      border-color: #99c9bb;
-    }
-    .calendar-day.range-edge {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    .calendar-day:disabled {
-      color: #b8c0bd;
-      cursor: default;
-      background: #f8faf9;
-    }
-    .calendar-usage {
-      color: var(--muted);
-      font-size: 10px;
-      line-height: 1.2;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .calendar-day.range-edge .calendar-usage {
-      color: rgba(255, 255, 255, 0.84);
-    }
-    .lang-toggle {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 3px;
-      min-height: 36px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }
-    .lang-option {
-      min-height: 28px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 9px;
-    }
-    .lang-option.active {
-      background: #17201d;
-      color: #fff;
-    }
-    button, select, input {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-      color: var(--text);
-      min-height: 36px;
-      font: inherit;
-    }
-    button {
-      padding: 0 12px;
-      cursor: pointer;
-    }
-    button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    button:hover { border-color: #9da9a4; }
-    main {
-      max-width: 1480px;
-      margin: 0 auto;
-      padding: 20px 24px 28px;
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
-      gap: 12px;
-      margin-bottom: 16px;
-    }
-    .metric {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px;
-      box-shadow: var(--shadow);
-      min-width: 0;
-    }
-    .metric .label {
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 6px;
-      white-space: nowrap;
-    }
-    .metric .value {
-      font-size: 22px;
-      font-weight: 700;
-      line-height: 1.1;
-      overflow-wrap: anywhere;
-    }
-    .metric .hint {
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 5px;
-      min-height: 16px;
-      overflow-wrap: anywhere;
-    }
-    .controls {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) 140px 150px 170px 210px 130px;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    input, select {
-      width: 100%;
-      padding: 0 10px;
-    }
-    .sort-toggle {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 4px;
-      min-height: 36px;
-      padding: 3px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }
-    .sort-option {
-      min-height: 28px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--muted);
-      font-weight: 700;
-      padding: 0 10px;
-    }
-    .sort-option.active {
-      background: var(--accent);
-      color: #fff;
-      box-shadow: 0 1px 4px rgba(15, 123, 99, 0.22);
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.8fr) minmax(360px, 0.9fr);
-      gap: 16px;
-      align-items: start;
-    }
-    section, aside {
-      min-width: 0;
-    }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-    }
-    .panel-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 14px 14px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-    .panel-title h2 {
-      margin: 0;
-      font-size: 15px;
-      letter-spacing: 0;
-    }
-    .count {
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .chart {
-      padding: 12px 14px 4px;
-      border-bottom: 1px solid var(--line);
-    }
-    .bar-row {
-      display: grid;
-      grid-template-columns: minmax(100px, 1fr) minmax(120px, 2fr) 90px;
-      gap: 10px;
-      align-items: center;
-      margin-bottom: 8px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .bar-label {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .bar-track {
-      height: 8px;
-      border-radius: 6px;
-      background: #edf0ef;
-      overflow: hidden;
-    }
-    .bar-fill {
-      height: 100%;
-      border-radius: 6px;
-      background: var(--accent);
-      min-width: 2px;
-    }
-    .table-wrap {
-      overflow: auto;
-      max-height: calc(100vh - 270px);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      min-width: 830px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 9px 8px;
-      text-align: left;
-      vertical-align: middle;
-    }
-    th {
-      position: sticky;
-      top: 0;
-      background: #fbfcfc;
-      color: var(--muted);
-      z-index: 1;
-      font-size: 12px;
-      font-weight: 650;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    td {
-      font-size: 13px;
-    }
-    .col-title { width: 238px; }
-    .col-total { width: 86px; }
-    .col-output { width: 78px; }
-    .col-cost { width: 72px; }
-    .col-cache { width: 82px; }
-    .col-turns { width: 58px; }
-    .col-model { width: 112px; }
-    .col-effort { width: 76px; }
-    th[data-sort="total_tokens"],
-    th[data-sort="output_tokens"],
-    th[data-sort="estimated_cost_usd"],
-    th[data-sort="cached_input_percent"],
-    th[data-sort="turn_count"] {
-      text-align: right;
-    }
-    th[data-sort="model"],
-    th[data-sort="effort"] {
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    tr:hover td { background: #f7faf9; }
-    tr.selected td { background: var(--soft); }
-    tr.project-group-row td {
-      background: #fbfcfc;
-      padding: 10px 12px;
-      border-top: 1px solid var(--line);
-      border-bottom: 1px solid var(--line);
-    }
-    tr.project-group-row:hover td {
-      background: #f4f8f6;
-    }
-    tr.project-group-row .project-aggregate-cell {
-      color: var(--project-summary);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    tr.project-group-row .project-total-cell {
-      font-weight: 800;
-    }
-    .project-title-cell {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
-      align-items: center;
-      min-width: 0;
-    }
-    .project-toggle {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-      width: 100%;
-      min-height: 30px;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      text-align: left;
-    }
-    .project-folder-icon {
-      width: 18px;
-      height: 18px;
-      flex: 0 0 auto;
-      color: var(--accent);
-    }
-    .project-name {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-weight: 750;
-    }
-    .project-meta {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin: 2px 0 0 30px;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .project-session-row .title-cell {
-      padding-left: 34px;
-    }
-    .project-session-row .title-line {
-      gap: 8px;
-      margin-bottom: 0;
-    }
-    .task-root-row .title-line {
-      gap: 6px;
-    }
-    .project-session-row .title-main {
-      margin-bottom: 0;
-    }
-    .project-session-row .title-sub {
-      display: none;
-    }
-    .task-expandable-row .title-cell {
-      padding-left: 8px;
-    }
-    .task-static-row .title-cell {
-      padding-left: 32px;
-    }
-    .project-session-row.task-expandable-row .title-cell {
-      padding-left: 34px;
-    }
-    .project-session-row.task-static-row .title-cell {
-      padding-left: 58px;
-    }
-    .task-child-row .title-cell {
-      padding-left: 48px;
-    }
-    .project-session-row.task-child-row .title-cell {
-      padding-left: 74px;
-    }
-    .task-toggle {
-      display: inline-grid;
-      place-items: center;
-      width: 18px;
-      min-width: 18px;
-      height: 22px;
-      padding: 0;
-      border: 0;
-      border-radius: 4px;
-      background: transparent;
-      color: var(--muted);
-    }
-    .task-toggle:hover {
-      background: #e8f1ee;
-      color: var(--accent);
-    }
-    .task-toggle::before {
-      content: '';
-      width: 6px;
-      height: 6px;
-      border-right: 2px solid currentColor;
-      border-bottom: 2px solid currentColor;
-      transform: rotate(-45deg);
-      transition: transform 120ms ease;
-    }
-    .task-toggle[aria-expanded="true"]::before {
-      transform: rotate(45deg) translate(-1px, -1px);
-    }
-    .task-expandable-row td {
-      cursor: pointer;
-    }
-    .project-more-row td {
-      background: #fff;
-      padding: 8px 8px 10px 34px;
-    }
-    .project-more-row:hover td {
-      background: #fff;
-    }
-    .project-more-btn {
-      min-height: 30px;
-      padding: 0 10px;
-      color: var(--accent);
-      border-color: #99c9bb;
-      background: #eef8f4;
-      font-weight: 700;
-    }
-    .rank {
-      color: var(--muted);
-      white-space: nowrap;
-      text-align: center;
-      padding-left: 4px;
-      padding-right: 4px;
-    }
-    .title-cell {
-      min-width: 0;
-    }
-    .title-line {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .title-main {
-      font-weight: 650;
-      margin-bottom: 4px;
-      line-height: 1.35;
-      min-width: 0;
-      flex: 1 1 auto;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .title-time {
-      flex: 0 0 auto;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 650;
-      white-space: nowrap;
-    }
-    .title-sub {
-      color: var(--muted);
-      font-size: 12px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .title-sub-text {
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .number {
-      font-variant-numeric: tabular-nums;
-      text-align: right;
-      white-space: nowrap;
-    }
-    .model-cell,
-    .effort-cell {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      flex: 0 0 auto;
-      min-height: 22px;
-      padding: 2px 7px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: #fff;
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .badge.active { color: var(--accent); border-color: #99c9bb; background: #eef8f4; }
-    .badge.archived { color: var(--accent-2); border-color: #e3b887; background: #fff6ec; }
-    .badge.env { color: var(--accent-3); border-color: #a9c0df; background: #eef4fb; }
-    .badge.env.wsl { color: var(--accent); border-color: #99c9bb; background: #eef8f4; }
-    .badge.env.windows { color: var(--accent-3); border-color: #a9c0df; background: #eef4fb; }
-    .badge.env.remote { color: #7a4c12; border-color: #e3c27a; background: #fff8e5; }
-    .badge.branch {
-      width: 24px;
-      min-width: 24px;
-      min-height: 22px;
-      justify-content: center;
-      padding: 2px;
-      color: #5b4aa0;
-      border-color: #c3b8ee;
-      background: #f4f1ff;
-    }
-    .branch-icon {
-      width: 13px;
-      height: 13px;
-      flex: 0 0 auto;
-    }
-    .remote-mark {
-      margin-right: 4px;
-      font-weight: 800;
-      line-height: 1;
-    }
-    .details {
-      position: sticky;
-      top: 94px;
-      max-height: calc(100vh - 112px);
-      overflow: auto;
-    }
-    .details-body {
-      padding: 14px;
-    }
-    .empty {
-      color: var(--muted);
-      padding: 22px 14px;
-      text-align: center;
-    }
-    .detail-title {
-      font-size: 17px;
-      font-weight: 750;
-      line-height: 1.35;
-      margin-bottom: 8px;
-      overflow-wrap: anywhere;
-    }
-    .detail-badges {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 6px;
-    }
-    .detail-meta {
-      display: grid;
-      gap: 8px;
-      margin: 12px 0;
-    }
-    .kv {
-      display: grid;
-      grid-template-columns: 110px minmax(0, 1fr);
-      gap: 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .kv strong {
-      color: var(--text);
-      font-weight: 550;
-      overflow-wrap: anywhere;
-    }
-    .breakdown {
-      display: grid;
-      gap: 8px;
-      margin: 14px 0;
-    }
-    .breakdown-row {
-      display: grid;
-      grid-template-columns: 92px minmax(100px, 1fr) 148px;
-      gap: 8px;
-      align-items: center;
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .breakdown-value {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      white-space: nowrap;
-    }
-    .breakdown-value strong {
-      color: var(--text);
-      font-weight: 650;
-    }
-    .price-tooltip-trigger {
-      cursor: help;
-      text-decoration-line: underline;
-      text-decoration-style: dotted;
-      text-underline-offset: 3px;
-    }
-    .price-tooltip-trigger:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-      border-radius: 2px;
-    }
-    .breakdown-row .bar-fill.input { background: var(--accent-3); }
-    .breakdown-row .bar-fill.cached { background: var(--accent); }
-    .breakdown-row .bar-fill.cache-write { background: #b64b72; }
-    .breakdown-row .bar-fill.output { background: var(--accent-2); }
-    .breakdown-row .bar-fill.reasoning { background: #6f6a25; }
-    canvas {
-      width: 100%;
-      height: 150px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fbfcfc;
-      display: block;
-    }
-    .section-label {
-      margin: 16px 0 8px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .mini-table {
-      min-width: 0;
-      font-size: 12px;
-    }
-    .timeline-table {
-      min-width: 680px;
-    }
-    .mini-table th, .mini-table td {
-      padding: 7px 8px;
-    }
-    .mini-table th {
-      position: static;
-      cursor: default;
-    }
-    .path {
-      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .notice {
-      margin-top: 10px;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-    .task-detail-summary {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px 14px;
-      align-items: center;
-      margin: 14px 0;
-      padding: 10px 12px;
-      border: 1px solid #99c9bb;
-      border-radius: 6px;
-      background: #eef8f4;
-    }
-    .task-detail-summary-label {
-      color: var(--accent);
-      font-size: 12px;
-      font-weight: 750;
-    }
-    .task-detail-summary-value {
-      color: var(--text);
-      font-size: 15px;
-      font-variant-numeric: tabular-nums;
-      font-weight: 750;
-      white-space: nowrap;
-    }
-    .task-detail-summary-meta {
-      grid-column: 1 / -1;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .error {
-      color: var(--danger);
-      padding: 14px;
-    }
-    @media (max-width: 1100px) {
-      .header-inner { grid-template-columns: 1fr; align-items: flex-start; }
-      .period-wrap { justify-self: start; width: 100%; max-width: 620px; }
-      .period-toggle { width: 100%; min-width: 0; }
-      .toolbar { justify-self: start; justify-content: flex-start; }
-      .metrics { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
-      .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .layout { grid-template-columns: 1fr; }
-      .details { position: static; max-height: none; }
-      .table-wrap { max-height: none; }
-    }
-    @media (max-width: 760px) {
-      .header-inner { grid-template-columns: 1fr; padding: 16px; }
-      main { padding: 16px; }
-      .toolbar { justify-content: flex-start; }
-      .period-toggle { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-      .period-option { padding: 0 6px; }
-      .calendar-popover { left: 0; transform: none; width: min(358px, calc(100vw - 32px)); }
-      .metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
-      .controls { grid-template-columns: 1fr; }
-      .project-title-cell { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-      .project-meta { flex-wrap: wrap; }
-      .project-session-row .title-cell { padding-left: 34px; }
-      .bar-row { grid-template-columns: 1fr; gap: 4px; }
-      .breakdown-row { grid-template-columns: 64px minmax(0, 1fr) minmax(112px, auto); gap: 6px; }
-      .breakdown-value { gap: 5px; }
-      .kv { grid-template-columns: 1fr; gap: 2px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite" aria-atomic="true">
-    <div class="loading-indicator">
-      <span class="loading-spinner" aria-hidden="true"></span>
-      <span data-i18n="loadingData">正在加载用量数据</span>
-    </div>
-  </div>
-  <header>
-    <div class="header-inner">
-      <div class="brand">
-        <h1>Codex Usage Dashboard</h1>
-        <div class="subtitle" id="codexHome" data-i18n="subtitle">读取本地 Codex 会话日志</div>
-      </div>
-      <div class="period-wrap" id="periodWrap">
-        <div class="period-toggle" aria-label="统计区间" data-i18n-aria="period">
-          <button class="period-option active" data-period-button="today" data-i18n="periodToday" type="button">今日</button>
-          <button class="period-option" data-period-button="7d" data-i18n="period7d" type="button">7日</button>
-          <button class="period-option" data-period-button="30d" data-i18n="period30d" type="button">30日</button>
-          <button class="period-option" data-period-button="week" data-i18n="periodWeek" type="button">本周</button>
-          <button class="period-option" data-period-button="month" data-i18n="periodMonth" type="button">本月</button>
-          <button class="period-option" data-period-button="all" data-i18n="periodAll" type="button">全部</button>
-          <button class="period-option" id="calendarBtn" data-i18n="calendarButton" type="button">日期</button>
-        </div>
-        <div class="calendar-popover" id="calendarPopover" hidden></div>
-      </div>
-      <div class="toolbar">
-        <div class="lang-toggle" aria-label="语言" data-i18n-aria="language">
-          <button class="lang-option active" data-lang-button="zh" type="button">中文</button>
-          <button class="lang-option" data-lang-button="en" type="button">EN</button>
-        </div>
-        <button id="refreshBtn" class="primary" title="重新扫描本地日志" data-i18n="refresh" data-i18n-title="refreshTitle">刷新</button>
-        <button id="remoteBtn" title="导入远程数据" data-i18n="importRemote" data-i18n-title="importRemoteTitle">导入远程数据</button>
-        <button id="snapshotExportBtn" title="导出当前设备快照" data-i18n="exportSnapshot" data-i18n-title="exportSnapshotTitle">导出快照</button>
-      </div>
-    </div>
-  </header>
-
-  <input id="remoteFileInput" type="file" accept="application/json,.json" hidden>
-  <div class="modal-backdrop" id="remoteModal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="remoteModalTitle">
-      <div class="modal-head">
-        <h2 id="remoteModalTitle" data-i18n="remoteData">远程数据</h2>
-        <button id="remoteCloseBtn" type="button" title="关闭" data-i18n-title="close">关闭</button>
-      </div>
-      <div class="modal-body" id="remoteModalBody"></div>
-      <div class="modal-actions">
-        <button id="remoteImportBtn" class="primary" type="button" data-i18n="importRemote">导入远程数据</button>
-      </div>
-    </div>
-  </div>
-
-  <main id="dashboardMain" aria-busy="true">
-    <div class="metrics" id="metrics"></div>
-
-    <div class="controls">
-      <input id="searchInput" type="search" placeholder="搜索标题、项目、路径、模型、环境" data-i18n-placeholder="searchPlaceholder">
-      <select id="environmentFilter" title="环境" data-i18n-title="environment">
-        <option value="all">全部环境</option>
-      </select>
-      <select id="sourceFilter" title="状态" data-i18n-title="source">
-        <option value="all">全部状态</option>
-        <option value="active">当前会话</option>
-        <option value="archived">归档会话</option>
-      </select>
-      <select id="modelFilter" title="模型" data-i18n-title="model">
-        <option value="all">全部模型</option>
-      </select>
-      <div class="sort-toggle" aria-label="视图" data-i18n-aria="view">
-        <button class="sort-option active" data-view-button="project" data-i18n="projectTab" type="button">项目</button>
-        <button class="sort-option" data-view-button="recent" data-i18n="recent" type="button">最近</button>
-        <button class="sort-option" data-view-button="total" data-i18n="total" type="button">总量</button>
-      </div>
-      <select id="limitSelect" title="显示数量" data-i18n-title="limitTitle">
-        <option value="50">前 50</option>
-        <option value="100">前 100</option>
-        <option value="all">全部</option>
-      </select>
-    </div>
-
-    <div class="layout">
-      <section class="panel">
-        <div class="panel-title">
-          <h2 data-i18n="conversations">对话</h2>
-          <div class="count" id="resultCount" data-i18n="loading">加载中</div>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <colgroup>
-              <col class="col-title">
-              <col class="col-total">
-              <col class="col-output">
-              <col class="col-cost">
-              <col class="col-cache">
-              <col class="col-turns">
-              <col class="col-model">
-              <col class="col-effort">
-            </colgroup>
-            <thead>
-              <tr>
-                <th data-sort="title" data-i18n="conversation">对话</th>
-                <th data-sort="total_tokens" data-i18n="total">总量</th>
-                <th data-sort="output_tokens" data-i18n="output">输出</th>
-                <th data-sort="estimated_cost_usd" data-i18n="cost">花费</th>
-                <th data-sort="cached_input_percent" data-i18n="cacheHit">缓存命中</th>
-                <th data-sort="turn_count" data-i18n="turns">轮次</th>
-                <th data-sort="model" data-i18n="model">模型</th>
-                <th data-sort="effort" data-i18n="reasoningEffort">推理强度</th>
-              </tr>
-            </thead>
-            <tbody id="sessionRows">
-              <tr><td colspan="8" class="empty" data-i18n="loading">加载中</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <aside class="panel details">
-        <div class="panel-title">
-          <h2 data-i18n="conversationDetails">对话明细</h2>
-          <div class="count" id="detailStatus" data-i18n="notSelected">未选择</div>
-        </div>
-        <div class="details-body" id="detailsBody">
-          <div class="empty" data-i18n="selectRow">点击左侧任意一行查看 token 明细和时间线。</div>
-        </div>
-      </aside>
-    </div>
-  </main>
-
-  <script>
-    const state = {
-      sessions: [],
-      summary: null,
-      codexHome: '',
-      codexSources: [],
-      generatedAt: '',
-      snapshotToken: '',
-      staleReloadToken: '',
-      selectedUid: null,
-      viewMode: 'project',
-      sortKey: 'end_at',
-      sortDir: 'desc',
-      projectExpanded: {},
-      projectShowAll: {},
-      taskExpanded: {},
-      search: '',
-      environment: 'all',
-      source: 'all',
-      model: 'all',
-      limit: '50',
-      period: 'today',
-      customStartDate: '',
-      customEndDate: '',
-      periodCache: new Map(),
-      dailyUsage: [],
-      dailyUsageComplete: false,
-      dailyUsageLoading: false,
-      remotes: [],
-      currentDeviceShortCode: '',
-      pendingRemoteSnapshot: null,
-      calendarOpen: false,
-      calendarMonth: '',
-      calendarDraftStart: '',
-      calendarDraftEnd: '',
-      lang: 'zh',
-      loading: false,
-      reloadAfterLoad: false,
-    };
-
-    const tokenKeys = ['input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens', 'reasoning_output_tokens', 'total_tokens'];
-    const projectPreviewLimit = 5;
-
-    const I18N = {
-      zh: {
-        subtitle: '读取本地 Codex 会话日志',
-        refresh: '刷新',
-        refreshTitle: '重新扫描本地日志',
-        importRemote: '导入远程数据',
-        manageRemote: '管理远程数据',
-        importRemoteTitle: '导入或管理其他设备导出的快照',
-        exportSnapshot: '导出快照',
-        exportSnapshotTitle: '导出当前设备的 Cousash JSON 快照',
-        remoteData: '远程数据',
-        close: '关闭',
-        remoteEmpty: '还没有导入远程设备数据。',
-        remoteImportHelp: '选择另一台设备导出的 Cousash JSON 快照文件。',
-        remoteNeedLabel: '这是新的远程设备，请输入显示名称。',
-        remoteCurrentWarning: '这个文件来自当前设备，导入后可能与本机实时统计重复。是否仍然导入为远程数据？',
-        remoteDeleteConfirm: '删除后无法恢复。确定删除这台远程设备的数据吗？',
-        remoteImported: '远程数据已导入。',
-        remoteDeleted: '远程数据已删除。',
-        remoteRenamed: '设备名称已更新。',
-        remoteImportFailed: '导入失败：{message}',
-        remoteName: '设备名',
-        remoteCode: '设备短码',
-        remoteSessions: '会话',
-        remoteUpdated: '快照时间',
-        remoteImportedAt: '导入时间',
-        remoteActions: '操作',
-        remoteUpdate: '更新',
-        remoteRename: '重命名',
-        remoteDelete: '删除',
-        remoteSave: '保存',
-        remoteCancel: '取消',
-        remoteDevicePrefix: '远程',
-        language: '语言',
-        period: '统计区间',
-        periodToday: '今日',
-        period7d: '7日',
-        period30d: '30日',
-        periodWeek: '本周',
-        periodMonth: '本月',
-        periodAll: '全部',
-        periodCustom: '{start}-{end}',
-        calendarButton: '日期',
-        calendarTitle: '选择日期',
-        calendarApply: '应用',
-        calendarCancel: '取消',
-        calendarPrev: '上月',
-        calendarNext: '下月',
-        calendarWeekdays: ['一', '二', '三', '四', '五', '六', '日'],
-        searchPlaceholder: '搜索标题、项目、路径、模型、环境',
-        environment: '环境',
-        environmentAll: '全部环境',
-        source: '状态',
-        sourceAll: '全部状态',
-        sourceActive: '当前会话',
-        sourceArchived: '归档会话',
-        model: '模型',
-        allModels: '全部模型',
-        sort: '排序',
-        view: '视图',
-        projectTab: '项目',
-        recent: '最近',
-        total: '总量',
-        limitTitle: '显示数量',
-        limit50: '前 50',
-        limit100: '前 100',
-        limitAll: '全部',
-        conversations: '对话',
-        conversation: '对话',
-        output: '输出',
-        cost: '花费',
-        cacheHit: '缓存命中',
-        turns: '轮次',
-        reasoningEffort: '推理强度',
-        conversationDetails: '对话明细',
-        loading: '加载中',
-        loadingData: '正在加载用量数据',
-        notSelected: '未选择',
-        selectRow: '点击左侧任意一行查看 token 明细和时间线。',
-        scanning: '扫描中',
-        scanned: '扫描',
-        loadFailed: '加载失败：{message}',
-        noMatches: '没有匹配的会话',
-        projectRowCount: '{projects} 个工作区 · {sessions} 条对话',
-        projectConversationCount: '{count} 条对话',
-        projectLatest: '最近 {time}',
-        showMoreConversations: '展开剩余 {count} 条',
-        showFewerConversations: '收起到 5 条',
-        showMoreTasks: '展开剩余 {count} 个任务',
-        showFewerTasks: '收起到 5 个任务',
-        collapseProject: '收起工作区',
-        expandProject: '展开工作区',
-        expandTask: '展开子 agent',
-        collapseTask: '收起子 agent',
-        taskRowCount: '{tasks} 个任务 · {agents} 个 agent',
-        taskTotal: '任务合计',
-        mixed: '混合',
-        priceKnown: '按公开 API 标准价格估算花费',
-        priceUnknown: '没有匹配到公开模型价格',
-        archived: '归档',
-        justNow: '刚刚',
-        minutes: '{value} 分钟',
-        hours: '{value} 小时',
-        days: '{value} 天',
-        months: '{value} 个月',
-        years: '{value} 年',
-        seconds: '{value} 秒',
-        minutesSeconds: '{minutes} 分 {seconds} 秒',
-        hoursMinutes: '{hours} 小时 {minutes} 分',
-        metricSessions: '会话数',
-        metricSessionsHint: '当前 {active} · 归档 {archived}',
-        metricSessionsHintWithEnvs: '当前 {active} · 归档 {archived} · {envs}',
-        metricTotalTokens: '总 tokens',
-        metricPeriodTotalTokens: '{period}总 tokens',
-        metricCost: '估算价格',
-        metricCostHint: '{count} 个会话可估算',
-        metricInput: '输入 tokens',
-        metricCached: '缓存输入',
-        metricOutput: '输出 tokens',
-        rowCount: '{count} 条',
-        detailsLoading: '加载中',
-        detailFailed: '明细加载失败：{message}',
-        failed: '失败',
-        countEvents: '{count} 次计数',
-        turnSuffix: '{count} 轮',
-        input: '输入',
-        cached: '缓存',
-        cacheWrite: '缓存写入',
-        reasoning: '推理',
-        reasoningCostTitle: '推理花费按输出单价估算，已包含在输出花费中',
-        unitPriceSegment: '{model}：{price} / 100万 tokens · 该档合计 {tokens} tokens',
-        priceShortContext: '（短上下文）',
-        priceLongContext: '（长上下文）',
-        cumulativeChart: '累计曲线',
-        metadata: '元数据',
-        totalTokens: '总 tokens',
-        cachePercent: '缓存占比',
-        time: '时间',
-        totalDuration: '总耗时',
-        ttftAvg: 'TTFT 均值',
-        project: '项目',
-        projectRoot: '项目根目录',
-        workspaceRoot: '工作树目录',
-        branch: '分支',
-        worktree: '工作树',
-        cwd: '工作目录',
-        logFile: '日志文件',
-        codexHome: 'Codex home',
-        threadType: '线程类型',
-        subagent: '子代理',
-        parentThread: '父线程',
-        inheritedTokens: '继承基线',
-        branchTotalTokens: '分支原始累计',
-        forkBaselineStatus: '基线状态',
-        forkBaselineUnresolved: '未解析',
-        firstUserPrompt: '首条用户消息',
-        lastReplySummary: '最后回复摘要',
-        toolCalls: '工具调用',
-        tool: '工具',
-        count: '次数',
-        noToolCalls: '没有记录到工具调用。',
-        timelineDetails: '每次计数明细',
-        timelineTime: '时间',
-        timelineTotal: '本次总量',
-        noTimeline: '这个会话没有 token_count.info 记录。',
-        noCurve: '没有曲线数据',
-        countPoints: '{count} 次计数',
-      },
-      en: {
-        subtitle: 'Reading local Codex session logs',
-        refresh: 'Refresh',
-        refreshTitle: 'Rescan local logs',
-        importRemote: 'Import Remote',
-        manageRemote: 'Manage Remote',
-        importRemoteTitle: 'Import or manage snapshots exported from other devices',
-        exportSnapshot: 'Export Snapshot',
-        exportSnapshotTitle: 'Export this device as a Cousash JSON snapshot',
-        remoteData: 'Remote Data',
-        close: 'Close',
-        remoteEmpty: 'No remote device data has been imported.',
-        remoteImportHelp: 'Choose a Cousash JSON snapshot exported on another device.',
-        remoteNeedLabel: 'This is a new remote device. Enter a display name.',
-        remoteCurrentWarning: 'This file is from the current device. Importing it may duplicate local realtime data. Import it as remote data anyway?',
-        remoteDeleteConfirm: 'This cannot be undone. Delete this remote device data?',
-        remoteImported: 'Remote data imported.',
-        remoteDeleted: 'Remote data deleted.',
-        remoteRenamed: 'Device name updated.',
-        remoteImportFailed: 'Import failed: {message}',
-        remoteName: 'Device',
-        remoteCode: 'Short code',
-        remoteSessions: 'Sessions',
-        remoteUpdated: 'Snapshot',
-        remoteImportedAt: 'Imported',
-        remoteActions: 'Actions',
-        remoteUpdate: 'Update',
-        remoteRename: 'Rename',
-        remoteDelete: 'Delete',
-        remoteSave: 'Save',
-        remoteCancel: 'Cancel',
-        remoteDevicePrefix: 'Remote',
-        language: 'Language',
-        period: 'Range',
-        periodToday: 'Today',
-        period7d: '7d',
-        period30d: '30d',
-        periodWeek: 'Week',
-        periodMonth: 'Month',
-        periodAll: 'All',
-        periodCustom: '{start}-{end}',
-        calendarButton: 'Dates',
-        calendarTitle: 'Select Dates',
-        calendarApply: 'Apply',
-        calendarCancel: 'Cancel',
-        calendarPrev: 'Prev',
-        calendarNext: 'Next',
-        calendarWeekdays: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
-        searchPlaceholder: 'Search title, project, path, model, or environment',
-        environment: 'Environment',
-        environmentAll: 'All environments',
-        source: 'Status',
-        sourceAll: 'All statuses',
-        sourceActive: 'Active',
-        sourceArchived: 'Archived',
-        model: 'Model',
-        allModels: 'All models',
-        sort: 'Sort',
-        view: 'View',
-        projectTab: 'Project',
-        recent: 'Recent',
-        total: 'Total',
-        limitTitle: 'Rows',
-        limit50: 'Top 50',
-        limit100: 'Top 100',
-        limitAll: 'All',
-        conversations: 'Conversations',
-        conversation: 'Conversation',
-        output: 'Output',
-        cost: 'Cost',
-        cacheHit: 'Cache hit',
-        turns: 'Turns',
-        reasoningEffort: 'Reasoning',
-        conversationDetails: 'Details',
-        loading: 'Loading',
-        loadingData: 'Loading usage data',
-        notSelected: 'No selection',
-        selectRow: 'Select a row to inspect token details and timeline.',
-        scanning: 'Scanning',
-        scanned: 'scanned',
-        loadFailed: 'Load failed: {message}',
-        noMatches: 'No matching conversations',
-        projectRowCount: '{projects} workspaces · {sessions} conversations',
-        projectConversationCount: '{count} conversations',
-        projectLatest: 'Latest {time}',
-        showMoreConversations: 'Show {count} more',
-        showFewerConversations: 'Show first 5',
-        showMoreTasks: 'Show {count} more tasks',
-        showFewerTasks: 'Show first 5 tasks',
-        collapseProject: 'Collapse workspace',
-        expandProject: 'Expand workspace',
-        expandTask: 'Expand subagents',
-        collapseTask: 'Collapse subagents',
-        taskRowCount: '{tasks} tasks · {agents} agents',
-        taskTotal: 'Task total',
-        mixed: 'Mixed',
-        priceKnown: 'Estimated from public API prices',
-        priceUnknown: 'No matching public model price',
-        archived: 'Archived',
-        justNow: 'just now',
-        minutes: '{value} min',
-        hours: '{value} hr',
-        days: '{value} days',
-        months: '{value} mo',
-        years: '{value} yr',
-        seconds: '{value} sec',
-        minutesSeconds: '{minutes} min {seconds} sec',
-        hoursMinutes: '{hours} hr {minutes} min',
-        metricSessions: 'Sessions',
-        metricSessionsHint: 'Active {active} · Archived {archived}',
-        metricSessionsHintWithEnvs: 'Active {active} · Archived {archived} · {envs}',
-        metricTotalTokens: 'Total tokens',
-        metricPeriodTotalTokens: '{period} total tokens',
-        metricCost: 'Estimated cost',
-        metricCostHint: '{count} sessions priced',
-        metricInput: 'Input tokens',
-        metricCached: 'Cached input',
-        metricOutput: 'Output tokens',
-        rowCount: '{count} rows',
-        detailsLoading: 'Loading',
-        detailFailed: 'Detail load failed: {message}',
-        failed: 'Failed',
-        countEvents: '{count} counts',
-        turnSuffix: '{count} turns',
-        input: 'Input',
-        cached: 'Cached',
-        cacheWrite: 'Cache write',
-        reasoning: 'Reasoning',
-        reasoningCostTitle: 'Reasoning cost is estimated at the output rate and is included in output cost.',
-        unitPriceSegment: '{model}: {price} / 1M tokens · {tokens} tokens at this rate',
-        priceShortContext: ' (short context)',
-        priceLongContext: ' (long context)',
-        cumulativeChart: 'Cumulative Chart',
-        metadata: 'Metadata',
-        totalTokens: 'Total tokens',
-        cachePercent: 'Cache rate',
-        time: 'Time',
-        totalDuration: 'Total duration',
-        ttftAvg: 'Avg TTFT',
-        project: 'Project',
-        projectRoot: 'Project root',
-        workspaceRoot: 'Worktree dir',
-        branch: 'Branch',
-        worktree: 'Worktree',
-        cwd: 'Working dir',
-        logFile: 'Log file',
-        codexHome: 'Codex home',
-        threadType: 'Thread type',
-        subagent: 'Subagent',
-        parentThread: 'Parent thread',
-        inheritedTokens: 'Inherited baseline',
-        branchTotalTokens: 'Raw branch total',
-        forkBaselineStatus: 'Baseline status',
-        forkBaselineUnresolved: 'Unresolved',
-        firstUserPrompt: 'First User Message',
-        lastReplySummary: 'Last Reply Summary',
-        toolCalls: 'Tool Calls',
-        tool: 'Tool',
-        count: 'Count',
-        noToolCalls: 'No tool calls recorded.',
-        timelineDetails: 'Token Count Events',
-        timelineTime: 'Time',
-        timelineTotal: 'Event total',
-        noTimeline: 'This conversation has no token_count.info records.',
-        noCurve: 'No chart data',
-        countPoints: '{count} counts',
-      },
-    };
-
-    function t(key, vars = {}) {
-      const template = (I18N[state.lang] && I18N[state.lang][key]) || I18N.zh[key] || key;
-      return template.replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? ''));
-    }
-
-    function locale() {
-      return state.lang === 'en' ? 'en-US' : 'zh-CN';
-    }
-
-    function applyStaticText() {
-      document.documentElement.lang = state.lang === 'en' ? 'en' : 'zh-CN';
-      document.querySelectorAll('[data-i18n]').forEach(el => {
-        el.textContent = t(el.dataset.i18n);
-      });
-      document.querySelectorAll('[data-i18n-title]').forEach(el => {
-        el.title = t(el.dataset.i18nTitle);
-      });
-      document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-        el.placeholder = t(el.dataset.i18nPlaceholder);
-      });
-      document.querySelectorAll('[data-i18n-aria]').forEach(el => {
-        el.setAttribute('aria-label', t(el.dataset.i18nAria));
-      });
-      document.querySelectorAll('[data-lang-button]').forEach(button => {
-        button.classList.toggle('active', button.dataset.langButton === state.lang);
-      });
-      updateRemoteButton();
-      updatePeriodButtons();
-      if (state.generatedAt) {
-        document.getElementById('codexHome').textContent = `${state.codexHome || ''} · ${fmtDate(state.generatedAt)} ${t('scanned')}`;
-      }
-    }
-
-    function environmentsFromSessions() {
-      const seen = new Map();
-      state.sessions.forEach(row => {
-        const id = row.environment_id || row.environment || 'local';
-        if (!seen.has(id)) seen.set(id, { id, label: row.environment || id });
-      });
-      return Array.from(seen.values());
-    }
-
-    function populateEnvironmentFilter() {
-      const select = document.getElementById('environmentFilter');
-      const oldValue = select.value || state.environment;
-      const sources = state.codexSources.length ? state.codexSources : environmentsFromSessions();
-      select.innerHTML = `<option value="all">${escapeHtml(t('environmentAll'))}</option>` + sources
-        .map(source => `<option value="${escapeHtml(source.id)}">${escapeHtml(source.label)}</option>`)
-        .join('');
-      const values = sources.map(source => source.id);
-      select.value = values.includes(oldValue) ? oldValue : 'all';
-      state.environment = select.value;
-    }
-
-    function populateSourceFilter() {
-      const select = document.getElementById('sourceFilter');
-      const oldValue = select.value || state.source;
-      select.innerHTML = [
-        ['all', t('sourceAll')],
-        ['active', t('sourceActive')],
-        ['archived', t('sourceArchived')],
-      ].map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('');
-      select.value = ['all', 'active', 'archived'].includes(oldValue) ? oldValue : 'all';
-      state.source = select.value;
-    }
-
-    function populateLimitSelect() {
-      const select = document.getElementById('limitSelect');
-      const oldValue = select.value || state.limit;
-      select.innerHTML = [
-        ['50', t('limit50')],
-        ['100', t('limit100')],
-        ['all', t('limitAll')],
-      ].map(([value, label]) => `<option value="${value}">${escapeHtml(label)}</option>`).join('');
-      select.value = ['50', '100', 'all'].includes(oldValue) ? oldValue : '50';
-      state.limit = select.value;
-    }
-
-    function setLanguage(lang) {
-      state.lang = lang === 'en' ? 'en' : 'zh';
-      applyStaticText();
-      populateEnvironmentFilter();
-      populateSourceFilter();
-      populateLimitSelect();
-      populateModelFilter();
-      renderAll();
-      if (state.selectedUid) showDetails(state.selectedUid, false);
-    }
-
-    function usageOf(row) {
-      return row && row.total_token_usage ? row.total_token_usage : {};
-    }
-
-    function tokenValue(row, key) {
-      return Number(usageOf(row)[key] || 0);
-    }
-
-    function zeroClientUsage() {
-      return Object.fromEntries(tokenKeys.map(key => [key, 0]));
-    }
-
-    function addClientUsage(left, right) {
-      const usage = {};
-      tokenKeys.forEach(key => {
-        usage[key] = Number(left?.[key] || 0) + Number(right?.[key] || 0);
-      });
-      return usage;
-    }
-
-    function fmtPercent(value) {
-      if (value === null || value === undefined || value === '') return 'N/A';
-      const number = Number(value);
-      if (!Number.isFinite(number)) return 'N/A';
-      return number.toFixed(1) + '%';
-    }
-
-    function fmtUsd(value) {
-      if (value === null || value === undefined || value === '') return 'N/A';
-      const number = Number(value);
-      if (!Number.isFinite(number)) return 'N/A';
-      if (number > 0 && number < 0.01) return '$' + number.toFixed(4);
-      return '$' + number.toFixed(2);
-    }
-
-    function fmtUsdRate(value) {
-      const number = Number(value);
-      if (!Number.isFinite(number)) return 'N/A';
-      if (Math.abs(number - Number(number.toFixed(2))) < 1e-9) return '$' + number.toFixed(2);
-      if (Math.abs(number - Number(number.toFixed(3))) < 1e-9) return '$' + number.toFixed(3);
-      return '$' + number.toFixed(4);
-    }
-
-    function fmt(n) {
-      return Number(n || 0).toLocaleString(locale());
-    }
-
-    function fmtCompact(n) {
-      const value = Number(n || 0);
-      if (value >= 1000000000) return (value / 1000000000).toFixed(2) + 'B';
-      if (value >= 1000000) return (value / 1000000).toFixed(2) + 'M';
-      if (value >= 1000) return (value / 1000).toFixed(1) + 'K';
-      return String(value);
-    }
-
-    function fmtCalendarTokens(n) {
-      const value = Number(n || 0);
-      if (value >= 1000000000) {
-        const compact = value / 1000000000;
-        return (compact > 10 ? Math.round(compact) : compact.toFixed(2)) + 'B';
-      }
-      if (value >= 1000000) {
-        const compact = value / 1000000;
-        return (compact > 10 ? Math.round(compact) : compact.toFixed(2)) + 'M';
-      }
-      if (value >= 1000) {
-        const compact = value / 1000;
-        return (compact > 10 ? Math.round(compact) : compact.toFixed(1)) + 'K';
-      }
-      return String(value);
-    }
-
-    function fmtDate(value) {
-      if (!value) return '';
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return String(value);
-      return date.toLocaleString(locale(), { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-    }
-
-    function fmtRelativeTime(value) {
-      if (!value) return '';
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return '';
-      const diffSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
-      if (diffSeconds < 60) return t('justNow');
-      const minutes = Math.floor(diffSeconds / 60);
-      if (minutes < 60) return t('minutes', { value: minutes });
-      const hours = Math.floor(minutes / 60);
-      if (hours < 48) return t('hours', { value: hours });
-      const days = Math.floor(hours / 24);
-      if (days < 30) return t('days', { value: days });
-      const months = Math.floor(days / 30);
-      if (months < 12) return t('months', { value: months });
-      return t('years', { value: Math.floor(months / 12) });
-    }
-
-    function fmtDuration(ms) {
-      if (!ms) return '';
-      const seconds = Math.round(ms / 1000);
-      if (seconds < 60) return t('seconds', { value: seconds });
-      const minutes = Math.floor(seconds / 60);
-      const rest = seconds % 60;
-      if (minutes < 60) return t('minutesSeconds', { minutes, seconds: rest });
-      const hours = Math.floor(minutes / 60);
-      return t('hoursMinutes', { hours, minutes: minutes % 60 });
-    }
-
-    function escapeHtml(value) {
-      return String(value ?? '')
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
-    }
-
-    function shortPath(path) {
-      if (!path) return '';
-      const parts = String(path).split(/[\\/]+/).filter(Boolean);
-      return parts.slice(-3).join(' / ');
-    }
-
-    function rowTime(row) {
-      const date = new Date(row.end_at || row.updated_at || row.start_at || 0);
-      const value = date.getTime();
-      return Number.isFinite(value) ? value : 0;
-    }
-
-    function projectName(row) {
-      return row.project || shortPath(row.cwd) || row.session_id || t('projectTab');
-    }
-
-    function workspaceKey(row) {
-      return row.project_root || row.cwd || row.project || row.path || row.session_id || 'unknown';
-    }
-
-    function projectKey(row) {
-      const environment = row.environment_id || row.environment || 'local';
-      return `${encodeURIComponent(environment)}::${encodeURIComponent(workspaceKey(row))}`;
-    }
-
-    function badgeClass(value) {
-      return String(value || 'local').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
-    }
-
-    function environmentBadge(row) {
-      const label = row.environment || '';
-      if (!label) return '';
-      const remote = row.is_remote ? `<span class="remote-mark" title="${escapeHtml(t('remoteDevicePrefix'))}">↗</span>` : '';
-      return `<span class="badge env ${row.is_remote ? 'remote' : ''} ${escapeHtml(badgeClass(row.environment_id || label))}">${remote}${escapeHtml(label)}</span>`;
-    }
-
-    function folderIcon() {
-      return `
-        <svg class="project-folder-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.2a2 2 0 0 1-1.6-.8l-.4-.6A2 2 0 0 0 9.2 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z"></path>
-        </svg>
-      `;
-    }
-
-    function branchIcon() {
-      return `
-        <svg class="branch-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="6" cy="6" r="3"></circle>
-          <circle cx="18" cy="18" r="3"></circle>
-          <path d="M6 9v3a6 6 0 0 0 6 6h3"></path>
-          <path d="M6 9v12"></path>
-        </svg>
-      `;
-    }
-
-    function branchBadge(row) {
-      if (!row.is_git_worktree) return '';
-      const label = row.project_branch || shortPath(row.workspace_root || row.cwd) || t('worktree');
-      const title = row.workspace_root || row.cwd
-        ? `${label} · ${row.workspace_root || row.cwd}`
-        : label;
-      return `<span class="badge branch" title="${escapeHtml(title)}" aria-label="${escapeHtml(label)}">${branchIcon()}</span>`;
-    }
-
-    function sourceBadge(source) {
-      if (source !== 'archived') return '';
-      const text = t('archived');
-      return `<span class="badge ${escapeHtml(source)}">${text}</span>`;
-    }
-
-    function periodParams(period = state.period) {
-      const params = new URLSearchParams({ period });
-      if (period === 'custom') {
-        if (state.customStartDate) params.set('start', state.customStartDate);
-        if (state.customEndDate) params.set('end', state.customEndDate);
-      }
-      return params;
-    }
-
-    function periodCacheKey(period = state.period, startDate = state.customStartDate, endDate = state.customEndDate) {
-      return `${period}|${startDate || ''}|${endDate || ''}`;
-    }
-
-    function mergeDailyUsage(currentRows, incomingRows) {
-      const rowsByDate = new Map((currentRows || []).map(row => [row.date, row]));
-      (incomingRows || []).forEach(row => {
-        if (row && row.date) rowsByDate.set(row.date, row);
-      });
-      return Array.from(rowsByDate.values()).sort((left, right) => String(left.date).localeCompare(String(right.date)));
-    }
-
-    async function applySessionData(data, requestedPeriod, requestedStart, requestedEnd, selectTop = true) {
-      const nextSnapshotToken = data.snapshot_token || '';
-      if (state.snapshotToken !== nextSnapshotToken) state.staleReloadToken = '';
-      state.snapshotToken = nextSnapshotToken;
-      state.sessions = data.sessions || [];
-      state.summary = data.summary || null;
-      const incomingDailyUsage = data.daily_usage || [];
-      if (data.daily_usage_complete) {
-        state.dailyUsage = incomingDailyUsage;
-        state.dailyUsageComplete = true;
-      } else {
-        state.dailyUsage = mergeDailyUsage(state.dailyUsage, incomingDailyUsage);
-      }
-      state.remotes = data.remotes || [];
-      state.currentDeviceShortCode = data.current_device_short_code || '';
-      state.codexHome = data.codex_home || '';
-      state.codexSources = data.codex_sources || [];
-      state.generatedAt = data.generated_at || '';
-      state.period = data.period?.key || requestedPeriod;
-      if (state.period === 'custom') {
-        state.customStartDate = data.period?.start_date || requestedStart;
-        state.customEndDate = data.period?.end_date || requestedEnd || state.customStartDate;
-      }
-      document.getElementById('codexHome').textContent = `${state.codexHome || ''} · ${fmtDate(state.generatedAt)} ${t('scanned')}`;
-      updateRemoteButton();
-      populateEnvironmentFilter();
-      populateModelFilter();
-      if (state.selectedUid && !state.sessions.some(row => row.uid === state.selectedUid)) {
-        state.selectedUid = null;
-      }
-      renderAll();
-      const visibleRows = currentSelectableRows();
-      if ((selectTop || !state.selectedUid) && visibleRows.length) {
-        const first = visibleRows[0];
-        if (first) void showDetails(first.uid);
-      } else if (state.selectedUid) {
-        void showDetails(state.selectedUid, false);
-      } else {
-        clearDetails();
-      }
-    }
-
-    function setLoadingIndicator(active, silent = false) {
-      const overlay = document.getElementById('loadingOverlay');
-      const main = document.getElementById('dashboardMain');
-      const visible = Boolean(active && !silent);
-      overlay.hidden = !visible;
-      main.setAttribute('aria-busy', active ? 'true' : 'false');
-      document.body.classList.toggle('data-loading', visible);
-    }
-
-    async function loadData(selectTop = true, options = {}) {
-      if (state.loading) {
-        if (!options.silent) {
-          state.reloadAfterLoad = true;
-          setLoadingIndicator(true);
-        }
-        return;
-      }
-      state.loading = true;
-      state.reloadAfterLoad = false;
-      setLoadingIndicator(true, options.silent === true);
-      const requestedPeriod = state.period;
-      const requestedStart = state.customStartDate;
-      const requestedEnd = state.customEndDate;
-      const cacheKey = periodCacheKey(requestedPeriod, requestedStart, requestedEnd);
-      const refreshBtn = document.getElementById('refreshBtn');
-      refreshBtn.disabled = true;
-      refreshBtn.textContent = t('scanning');
-      try {
-        const res = await fetch('/api/sessions?' + periodParams(requestedPeriod).toString(), { cache: 'no-store' });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        if (
-          state.period !== requestedPeriod
-          || state.customStartDate !== requestedStart
-          || state.customEndDate !== requestedEnd
-        ) {
-          state.reloadAfterLoad = true;
-          return;
-        }
-        state.periodCache.set(cacheKey, data);
-        await applySessionData(data, requestedPeriod, requestedStart, requestedEnd, selectTop);
-      } catch (err) {
-        document.getElementById('sessionRows').innerHTML = `<tr><td colspan="8" class="error">${escapeHtml(t('loadFailed', { message: err.message }))}</td></tr>`;
-      } finally {
-        refreshBtn.disabled = false;
-        refreshBtn.textContent = t('refresh');
-        state.loading = false;
-        if (state.reloadAfterLoad) {
-          state.reloadAfterLoad = false;
-          void loadData(true);
-        } else {
-          setLoadingIndicator(false);
-        }
-      }
-    }
-
-    function modelsOf(row) {
-      if (Array.isArray(row?.models) && row.models.length) {
-        return row.models.map(model => String(model || 'unknown'));
-      }
-      return [row?.model || 'unknown'];
-    }
-
-    function modelLabel(row) {
-      return modelsOf(row).join(', ');
-    }
-
-    function modelBadges(row) {
-      return modelsOf(row)
-        .map(model => `<span class="badge">${escapeHtml(model)}</span>`)
-        .join('');
-    }
-
-    function populateModelFilter() {
-      const select = document.getElementById('modelFilter');
-      const oldValue = select.value;
-      const models = Array.from(new Set(state.sessions.flatMap(row => modelsOf(row)))).sort();
-      select.innerHTML = `<option value="all">${escapeHtml(t('allModels'))}</option>` + models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
-      select.value = models.includes(oldValue) ? oldValue : 'all';
-      state.model = select.value;
-    }
-
-    function baseFilteredSessions() {
-      const needle = state.search.trim().toLowerCase();
-      return state.sessions.filter(row => {
-        if (state.environment !== 'all' && (row.environment_id || row.environment || 'local') !== state.environment) return false;
-        if (state.source !== 'all' && row.source !== state.source) return false;
-        if (state.model !== 'all' && !modelsOf(row).includes(state.model)) return false;
-        if (!needle) return true;
-        const haystack = [
-          row.title, row.session_id, modelLabel(row), row.project, row.project_root,
-          row.workspace_root, row.project_branch, row.cwd, row.path, row.source, row.environment
-        ].join(' ').toLowerCase();
-        return haystack.includes(needle);
-      });
-    }
-
-    function summarizeFilteredSessions() {
-      const rows = baseFilteredSessions();
-      let usage = zeroClientUsage();
-      let activeCount = 0;
-      let archivedCount = 0;
-      let estimatedCost = 0;
-      let estimatedCostKnownCount = 0;
-      const environments = new Map();
-
-      rows.forEach(row => {
-        const rowUsage = usageOf(row);
-        usage = addClientUsage(usage, rowUsage);
-        if (row.source === 'active') activeCount += 1;
-        if (row.source === 'archived') archivedCount += 1;
-        if (typeof row.estimated_cost_usd === 'number' && Number.isFinite(row.estimated_cost_usd)) {
-          estimatedCost += row.estimated_cost_usd;
-          estimatedCostKnownCount += 1;
-        }
-
-        const environmentId = row.environment_id || row.environment || 'local';
-        if (!environments.has(environmentId)) {
-          environments.set(environmentId, {
-            id: environmentId,
-            label: row.environment || environmentId,
-            sessions: 0,
-            usage: zeroClientUsage(),
-          });
-        }
-        const environment = environments.get(environmentId);
-        environment.sessions += 1;
-        environment.usage = addClientUsage(environment.usage, rowUsage);
-      });
-
-      return {
-        session_count: rows.length,
-        active_count: activeCount,
-        archived_count: archivedCount,
-        usage,
-        estimated_cost_usd: estimatedCost,
-        estimated_cost_known_count: estimatedCostKnownCount,
-        by_environment: Array.from(environments.values())
-          .sort((left, right) => right.usage.total_tokens - left.usage.total_tokens),
-      };
-    }
-
-    function sortSessions(rows) {
-      rows.sort((a, b) => {
-        let av;
-        let bv;
-        if (tokenKeys.includes(state.sortKey)) {
-          av = tokenValue(a, state.sortKey);
-          bv = tokenValue(b, state.sortKey);
-        } else if (state.sortKey === 'estimated_cost_usd') {
-          av = Number(a.estimated_cost_usd ?? -1);
-          bv = Number(b.estimated_cost_usd ?? -1);
-        } else if (state.sortKey === 'cached_input_percent' || state.sortKey === 'turn_count') {
-          av = Number(a[state.sortKey] ?? -1);
-          bv = Number(b[state.sortKey] ?? -1);
-        } else if (state.sortKey === 'rank') {
-          av = state.sessions.indexOf(a);
-          bv = state.sessions.indexOf(b);
-        } else {
-          av = a[state.sortKey] || '';
-          bv = b[state.sortKey] || '';
-        }
-
-        if (typeof av === 'number' && typeof bv === 'number') {
-          return state.sortDir === 'asc' ? av - bv : bv - av;
-        }
-        const result = String(av).localeCompare(String(bv), locale());
-        return state.sortDir === 'asc' ? result : -result;
-      });
-      return rows;
-    }
-
-    function agentTaskKey(row) {
-      const environment = row.environment_id || row.environment || 'local';
-      const rootSessionId = row.root_session_id || row.session_id || row.uid || 'unknown';
-      return `${encodeURIComponent(environment)}::${encodeURIComponent(rootSessionId)}`;
-    }
-
-    function aggregateTaskRow(root, rows, key) {
-      let usage = zeroClientUsage();
-      let cost = 0;
-      let pricesKnown = rows.length > 0;
-      let turnCount = 0;
-      let completedTurnCount = 0;
-      let latestRow = root;
-      let earliestRow = root;
-      const models = [];
-
-      rows.forEach(row => {
-        usage = addClientUsage(usage, usageOf(row));
-        turnCount += Number(row.turn_count || 0);
-        completedTurnCount += Number(row.completed_turn_count || 0);
-        const rowCost = Number(row.estimated_cost_usd);
-        if (row.price_model_known && Number.isFinite(rowCost)) cost += rowCost;
-        else pricesKnown = false;
-        if (rowTime(row) > rowTime(latestRow)) latestRow = row;
-        if (rowTime(row) < rowTime(earliestRow)) earliestRow = row;
-        modelsOf(row).forEach(model => {
-          if (!models.includes(model)) models.push(model);
-        });
-      });
-
-      const inputTokens = Number(usage.input_tokens || 0);
-      return {
-        ...root,
-        model: latestRow.model || root.model,
-        models: models.length ? models : modelsOf(root),
-        total_token_usage: usage,
-        estimated_cost_usd: pricesKnown ? cost : null,
-        price_model_known: pricesKnown,
-        cached_input_percent: inputTokens
-          ? Math.round(Number(usage.cached_input_tokens || 0) / inputTokens * 1000) / 10
-          : null,
-        turn_count: turnCount,
-        completed_turn_count: completedTurnCount,
-        start_at: earliestRow.start_at || earliestRow.created_at || root.start_at,
-        end_at: latestRow.end_at || latestRow.updated_at || latestRow.start_at || root.end_at,
-        task_group_key: key,
-      };
-    }
-
-    function taskGroupsForRows(rows) {
-      const groupsByKey = new Map();
-      rows.forEach(row => {
-        const key = agentTaskKey(row);
-        if (!groupsByKey.has(key)) {
-          groupsByKey.set(key, { key, rootSessionId: String(row.root_session_id || row.session_id || ''), rows: [] });
-        }
-        groupsByKey.get(key).rows.push(row);
-      });
-
-      const groups = Array.from(groupsByKey.values()).map(group => {
-        const bySessionId = new Map();
-        group.rows.forEach(row => {
-          const sessionId = String(row.session_id || '');
-          if (sessionId && !bySessionId.has(sessionId)) bySessionId.set(sessionId, row);
-        });
-        const root = group.rows.find(row => String(row.session_id || '') === group.rootSessionId && !row.is_subagent)
-          || group.rows.find(row => String(row.session_id || '') === group.rootSessionId)
-          || group.rows.find(row => !row.is_subagent)
-          || group.rows[0];
-        const childrenByUid = new Map();
-        const topLevelRows = [];
-        group.rows.forEach(row => {
-          if (row.uid === root.uid) return;
-          const parent = bySessionId.get(String(row.parent_thread_id || ''));
-          if (parent && parent.uid !== row.uid) {
-            if (!childrenByUid.has(parent.uid)) childrenByUid.set(parent.uid, []);
-            childrenByUid.get(parent.uid).push(row);
-          } else {
-            topLevelRows.push(row);
-          }
-        });
-        childrenByUid.forEach(children => sortSessions(children));
-        sortSessions(topLevelRows);
-        group.root = root;
-        group.childrenByUid = childrenByUid;
-        group.topLevelRows = topLevelRows;
-        group.subagentCount = Math.max(0, group.rows.length - 1);
-        group.displayRow = aggregateTaskRow(root, group.rows, group.key);
-        return group;
-      });
-
-      const byKey = new Map(groups.map(group => [group.key, group]));
-      return sortSessions(groups.map(group => group.displayRow))
-        .map(row => byKey.get(row.task_group_key));
-    }
-
-    function taskGroups() {
-      let groups = taskGroupsForRows(baseFilteredSessions());
-      if (state.limit !== 'all') groups = groups.slice(0, Number(state.limit));
-      return groups;
-    }
-
-    function isTaskExpanded(group) {
-      return state.taskExpanded[group.key] === true;
-    }
-
-    function taskChildRows(group) {
-      const rows = [];
-      const visited = new Set([group.root.uid]);
-      const visit = (row, depth) => {
-        if (visited.has(row.uid)) return;
-        visited.add(row.uid);
-        rows.push({ row, depth });
-        (group.childrenByUid.get(row.uid) || []).forEach(child => visit(child, depth + 1));
-      };
-      (group.childrenByUid.get(group.root.uid) || []).forEach(row => visit(row, 1));
-      group.topLevelRows.forEach(row => visit(row, 1));
-      group.rows.forEach(row => visit(row, 1));
-      return rows;
-    }
-
-    function taskGroupRowsHtml(group, extraClass = '', options = {}) {
-      const expanded = isTaskExpanded(group);
-      const rootClasses = [
-        'task-root-row',
-        group.subagentCount ? 'task-expandable-row' : 'task-static-row',
-        extraClass,
-      ].filter(Boolean).join(' ');
-      const childClasses = ['task-child-row', extraClass].filter(Boolean).join(' ');
-      const root = sessionRowHtml(group.displayRow, rootClasses, {
-        ...options,
-        selectable: group.subagentCount === 0,
-        task: { key: group.key, expanded, subagentCount: group.subagentCount },
-      });
-      if (!expanded || !group.subagentCount) return root;
-      return [
-        root,
-        sessionRowHtml(group.root, childClasses, options),
-        ...taskChildRows(group).map(({ row }) => sessionRowHtml(row, childClasses, options)),
-      ].join('');
-    }
-
-    function taskGroupForUid(uid) {
-      return taskGroupsForRows(baseFilteredSessions()).find(group =>
-        group.rows.some(row => row.uid === uid)
-      ) || null;
-    }
-
-    function summarizeProjectRows(rows) {
-      let usage = zeroClientUsage();
-      let cost = 0;
-      let pricesKnown = rows.length > 0;
-      let turnCount = 0;
-      const models = [];
-      const efforts = [];
-
-      rows.forEach(row => {
-        usage = addClientUsage(usage, usageOf(row));
-        turnCount += Number(row.turn_count || 0);
-        const rowCost = Number(row.estimated_cost_usd);
-        if (row.price_model_known && Number.isFinite(rowCost)) cost += rowCost;
-        else pricesKnown = false;
-        modelsOf(row).forEach(model => {
-          if (!models.includes(model)) models.push(model);
-        });
-        const effort = String(row.effort || '').trim();
-        if (effort && !efforts.includes(effort)) efforts.push(effort);
-      });
-
-      const inputTokens = Number(usage.input_tokens || 0);
-      return {
-        usage,
-        estimated_cost_usd: pricesKnown ? cost : null,
-        price_model_known: pricesKnown,
-        cached_input_percent: inputTokens
-          ? Math.round(Number(usage.cached_input_tokens || 0) / inputTokens * 1000) / 10
-          : null,
-        turn_count: turnCount,
-        models,
-        efforts,
-      };
-    }
-
-    function projectEffortLabel(group) {
-      if (!group.efforts.length) return 'N/A';
-      return group.efforts.length === 1 ? group.efforts[0] : t('mixed');
-    }
-
-    function projectGroups() {
-      const groups = new Map();
-      baseFilteredSessions().forEach(row => {
-        const key = projectKey(row);
-        if (!groups.has(key)) {
-          groups.set(key, {
-            key,
-            label: projectName(row),
-            workspace: workspaceKey(row),
-            environment: row.environment || '',
-            environment_id: row.environment_id || '',
-            is_remote: Boolean(row.is_remote),
-            rows: [],
-            latestTime: 0,
-          });
-        }
-        const group = groups.get(key);
-        group.rows.push(row);
-        group.latestTime = Math.max(group.latestTime, rowTime(row));
-        if (!group.environment && row.environment) group.environment = row.environment;
-        if (!group.environment_id && row.environment_id) group.environment_id = row.environment_id;
-        if (row.is_remote) group.is_remote = true;
-      });
-
-      return Array.from(groups.values())
-        .map(group => {
-          group.rows.sort((a, b) => {
-            const archivedDelta = (a.source === 'archived' ? 1 : 0) - (b.source === 'archived' ? 1 : 0);
-            if (archivedDelta) return archivedDelta;
-            return rowTime(b) - rowTime(a) || String(a.title || '').localeCompare(String(b.title || ''), locale());
-          });
-          Object.assign(group, summarizeProjectRows(group.rows));
-          return group;
-        })
-        .sort((a, b) => b.latestTime - a.latestTime || a.label.localeCompare(b.label, locale()));
-    }
-
-    function isProjectExpanded(group) {
-      return state.projectExpanded[group.key] !== false;
-    }
-
-    function isProjectShowingAll(group) {
-      return state.projectShowAll[group.key] === true;
-    }
-
-    function visibleProjectRows() {
-      return projectGroups().flatMap(group => {
-        if (!isProjectExpanded(group)) return [];
-        const groups = taskGroupsForRows(group.rows);
-        const visibleGroups = isProjectShowingAll(group) ? groups : groups.slice(0, projectPreviewLimit);
-        return visibleGroups.flatMap(taskGroup => {
-          const rows = [taskGroup.displayRow];
-          if (isTaskExpanded(taskGroup)) rows.push(taskGroup.root, ...taskChildRows(taskGroup).map(item => item.row));
-          return rows;
-        });
-      });
-    }
-
-    function currentSelectableRows() {
-      if (state.viewMode === 'project') return visibleProjectRows();
-      return taskGroups().flatMap(group => {
-        const rows = [group.displayRow];
-        if (isTaskExpanded(group)) rows.push(group.root, ...taskChildRows(group).map(item => item.row));
-        return rows;
-      });
-    }
-
-    function renderAll() {
-      renderMetrics();
-      updatePeriodButtons();
-      updateViewButtons();
-      document.getElementById('limitSelect').disabled = state.viewMode === 'project';
-      renderTable();
-      if (state.calendarOpen) renderCalendar();
-    }
-
-    function setPeriod(period) {
-      if (state.period === period) return;
-      state.period = period;
-      state.selectedUid = null;
-      state.projectExpanded = {};
-      state.projectShowAll = {};
-      state.taskExpanded = {};
-      updatePeriodButtons();
-      const cached = state.periodCache.get(periodCacheKey());
-      if (cached) {
-        applySessionData(cached, state.period, state.customStartDate, state.customEndDate, false);
-      } else {
-        renderMetrics();
-        clearDetails();
-      }
-      loadData(false);
-    }
-
-    function setCustomPeriod(startDate, endDate) {
-      state.period = 'custom';
-      state.customStartDate = startDate;
-      state.customEndDate = endDate || startDate;
-      state.selectedUid = null;
-      state.projectExpanded = {};
-      state.projectShowAll = {};
-      state.taskExpanded = {};
-      state.calendarOpen = false;
-      updateCalendarVisibility();
-      updatePeriodButtons();
-      const cached = state.periodCache.get(periodCacheKey());
-      if (cached) {
-        applySessionData(cached, state.period, state.customStartDate, state.customEndDate, false);
-      } else {
-        clearDetails();
-      }
-      loadData(false);
-    }
-
-    function setPrimaryView(mode) {
-      state.viewMode = mode === 'recent' || mode === 'total' ? mode : 'project';
-      if (state.viewMode === 'recent') state.sortKey = 'end_at';
-      if (state.viewMode === 'total') state.sortKey = 'total_tokens';
-      state.sortDir = 'desc';
-      renderAll();
-    }
-
-    function updatePeriodButtons() {
-      document.querySelectorAll('[data-period-button]').forEach(button => {
-        button.classList.toggle('active', button.dataset.periodButton === state.period);
-      });
-      document.getElementById('calendarBtn').classList.toggle('active', state.period === 'custom');
-    }
-
-    function updateViewButtons() {
-      document.querySelectorAll('[data-view-button]').forEach(button => {
-        button.classList.toggle('active', button.dataset.viewButton === state.viewMode);
-      });
-    }
-
-    function periodLabel() {
-      const keys = {
-        today: 'periodToday',
-        '7d': 'period7d',
-        '30d': 'period30d',
-        week: 'periodWeek',
-        month: 'periodMonth',
-        all: 'periodAll',
-      };
-      if (state.period === 'custom') {
-        return t('periodCustom', {
-          start: shortDateLabel(state.customStartDate),
-          end: shortDateLabel(state.customEndDate || state.customStartDate),
-        });
-      }
-      return t(keys[state.period] || 'periodToday');
-    }
-
-    function dateFromKey(key) {
-      const parts = String(key || '').split('-').map(Number);
-      if (parts.length !== 3 || parts.some(part => !Number.isFinite(part))) return null;
-      return new Date(parts[0], parts[1] - 1, parts[2]);
-    }
-
-    function dateKey(date) {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    }
-
-    function shortDateLabel(key) {
-      const date = dateFromKey(key);
-      if (!date) return '';
-      return `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}`;
-    }
-
-    function monthKey(date) {
-      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-    }
-
-    function usageByDate() {
-      const map = new Map();
-      state.dailyUsage.forEach(row => {
-        map.set(row.date, Number(row.usage?.total_tokens || 0));
-      });
-      return map;
-    }
-
-    function latestUsageDate() {
-      const dates = state.dailyUsage.map(row => row.date).filter(Boolean).sort();
-      return dates.length ? dates[dates.length - 1] : dateKey(new Date());
-    }
-
-    function openCalendar() {
-      state.calendarOpen = true;
-      state.calendarDraftStart = state.customStartDate || '';
-      state.calendarDraftEnd = state.customEndDate || '';
-      const seed = state.calendarDraftStart || latestUsageDate();
-      state.calendarMonth = monthKey(dateFromKey(seed) || new Date());
-      updateCalendarVisibility();
-      renderCalendar();
-      loadDailyUsage();
-    }
-
-    function loadDailyUsage() {
-      if (state.dailyUsageComplete || state.dailyUsageLoading) return Promise.resolve();
-      state.dailyUsageLoading = true;
-      return fetch('/api/daily-usage', { cache: 'no-store' })
-        .then(res => {
-          if (!res.ok) throw new Error('HTTP ' + res.status);
-          return res.json();
-        })
-        .then(data => {
-          state.dailyUsage = data.daily_usage || [];
-          state.dailyUsageComplete = data.daily_usage_complete !== false;
-          if (state.calendarOpen) renderCalendar();
-        })
-        .catch(() => {})
-        .finally(() => {
-          state.dailyUsageLoading = false;
-        });
-    }
-
-    function closeCalendar() {
-      state.calendarOpen = false;
-      updateCalendarVisibility();
-    }
-
-    function updateCalendarVisibility() {
-      const popover = document.getElementById('calendarPopover');
-      popover.hidden = !state.calendarOpen;
-    }
-
-    function changeCalendarMonth(delta) {
-      const current = dateFromKey(`${state.calendarMonth || monthKey(new Date())}-01`) || new Date();
-      current.setMonth(current.getMonth() + delta);
-      state.calendarMonth = monthKey(current);
-      renderCalendar();
-    }
-
-    function inDraftRange(key) {
-      if (!state.calendarDraftStart) return false;
-      const start = state.calendarDraftStart;
-      const end = state.calendarDraftEnd || state.calendarDraftStart;
-      return key >= start && key <= end;
-    }
-
-    function isDraftEdge(key) {
-      return key === state.calendarDraftStart || key === state.calendarDraftEnd;
-    }
-
-    function selectCalendarDate(key) {
-      if (!state.calendarDraftStart || state.calendarDraftEnd) {
-        state.calendarDraftStart = key;
-        state.calendarDraftEnd = '';
-        renderCalendar();
-        return;
-      }
-      const start = state.calendarDraftStart;
-      if (key < start) setCustomPeriod(key, start);
-      else setCustomPeriod(start, key);
-    }
-
-    function applyCalendarRange() {
-      if (!state.calendarDraftStart) return;
-      setCustomPeriod(state.calendarDraftStart, state.calendarDraftEnd || state.calendarDraftStart);
-    }
-
-    function renderCalendar() {
-      const popover = document.getElementById('calendarPopover');
-      if (!popover || !state.calendarOpen) return;
-
-      const usageMap = usageByDate();
-      const todayKey = dateKey(new Date());
-      const monthStart = dateFromKey(`${state.calendarMonth || monthKey(new Date())}-01`) || new Date();
-      monthStart.setDate(1);
-      const title = monthStart.toLocaleDateString(locale(), { year: 'numeric', month: 'long' });
-      const firstGridDate = new Date(monthStart);
-      firstGridDate.setDate(monthStart.getDate() - ((monthStart.getDay() + 6) % 7));
-      const weekdays = (I18N[state.lang] && I18N[state.lang].calendarWeekdays) || I18N.zh.calendarWeekdays;
-      const nextMonth = new Date(monthStart);
-      nextMonth.setMonth(nextMonth.getMonth() + 1);
-      const nextDisabled = monthKey(nextMonth) > monthKey(new Date()) ? 'disabled' : '';
-
-      const days = [];
-      for (let index = 0; index < 42; index += 1) {
-        const date = new Date(firstGridDate);
-        date.setDate(firstGridDate.getDate() + index);
-        const key = dateKey(date);
-        const tokens = usageMap.get(key) || 0;
-        const classes = [
-          'calendar-day',
-          date.getMonth() === monthStart.getMonth() ? '' : 'outside',
-          inDraftRange(key) ? 'in-range' : '',
-          isDraftEdge(key) ? 'range-edge' : '',
-        ].filter(Boolean).join(' ');
-        const disabled = key > todayKey ? 'disabled' : '';
-        days.push(`
-          <button class="${classes}" type="button" data-calendar-date="${key}" ${disabled}>
-            <span>${date.getDate()}</span>
-            ${tokens ? `<span class="calendar-usage">${escapeHtml(fmtCalendarTokens(tokens))}</span>` : ''}
-          </button>
-        `);
-      }
-
-      popover.innerHTML = `
-        <div class="calendar-head">
-          <button type="button" title="${escapeHtml(t('calendarPrev'))}" data-calendar-prev>&lt;</button>
-          <div class="calendar-title">${escapeHtml(title)}</div>
-          <button type="button" title="${escapeHtml(t('calendarNext'))}" data-calendar-next ${nextDisabled}>&gt;</button>
-        </div>
-        <div class="calendar-grid">
-          ${weekdays.map(day => `<div class="calendar-weekday">${escapeHtml(day)}</div>`).join('')}
-          ${days.join('')}
-        </div>
-        <div class="calendar-actions">
-          <button type="button" data-calendar-cancel>${escapeHtml(t('calendarCancel'))}</button>
-          <button class="primary" type="button" data-calendar-apply ${state.calendarDraftStart ? '' : 'disabled'}>${escapeHtml(t('calendarApply'))}</button>
-        </div>
-      `;
-
-      popover.querySelector('[data-calendar-prev]').addEventListener('click', () => changeCalendarMonth(-1));
-      popover.querySelector('[data-calendar-next]').addEventListener('click', () => changeCalendarMonth(1));
-      popover.querySelector('[data-calendar-cancel]').addEventListener('click', closeCalendar);
-      popover.querySelector('[data-calendar-apply]').addEventListener('click', applyCalendarRange);
-      popover.querySelectorAll('[data-calendar-date]').forEach(button => {
-        button.addEventListener('click', () => selectCalendarDate(button.dataset.calendarDate));
-      });
-    }
-
-    function renderMetrics() {
-      const summary = summarizeFilteredSessions();
-      const usage = summary.usage;
-      const environmentRows = summary.by_environment;
-      const environmentHint = environmentRows.length > 1
-        ? environmentRows.map(row => `${row.label} ${fmt(row.sessions)}`).join(' · ')
-        : '';
-      const sessionHint = environmentHint
-        ? t('metricSessionsHintWithEnvs', { active: fmt(summary.active_count), archived: fmt(summary.archived_count), envs: environmentHint })
-        : t('metricSessionsHint', { active: fmt(summary.active_count), archived: fmt(summary.archived_count) });
-      const metrics = [
-        [t('metricSessions'), fmt(summary.session_count), sessionHint],
-        [t('metricPeriodTotalTokens', { period: periodLabel() }), fmtCompact(usage.total_tokens), fmt(usage.total_tokens)],
-        [t('metricCost'), fmtUsd(summary.estimated_cost_usd), t('metricCostHint', { count: fmt(summary.estimated_cost_known_count) })],
-        [t('metricInput'), fmtCompact(usage.input_tokens), fmt(usage.input_tokens)],
-        [t('metricCached'), fmtCompact(usage.cached_input_tokens), fmt(usage.cached_input_tokens)],
-        [t('metricOutput'), fmtCompact(usage.output_tokens), fmt(usage.output_tokens)],
-      ];
-      document.getElementById('metrics').innerHTML = metrics.map(([label, value, hint]) => `
-        <div class="metric">
-          <div class="label">${escapeHtml(label)}</div>
-          <div class="value">${escapeHtml(value)}</div>
-          <div class="hint">${escapeHtml(hint)}</div>
-        </div>
-      `).join('');
-    }
-
-    function renderTable() {
-      if (state.viewMode === 'project') {
-        renderProjectTable();
-        return;
-      }
-
-      const groups = taskGroups();
-      const agentCount = groups.reduce((count, group) => count + group.rows.length, 0);
-      document.getElementById('resultCount').textContent = t('taskRowCount', {
-        tasks: fmt(groups.length),
-        agents: fmt(agentCount),
-      });
-      if (!groups.length) {
-        document.getElementById('sessionRows').innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(t('noMatches'))}</td></tr>`;
-        return;
-      }
-      document.getElementById('sessionRows').innerHTML = groups.map(group => taskGroupRowsHtml(group)).join('');
-      bindTableInteractions();
-    }
-
-    function sessionRowHtml(row, extraClass = '', options = {}) {
-      const usage = usageOf(row);
-      const selectable = options.selectable !== false;
-      const selected = selectable && row.uid === state.selectedUid ? 'selected' : '';
-      const classes = [selected, extraClass].filter(Boolean).join(' ');
-      const timeValue = row.end_at || row.updated_at || row.start_at;
-      const compactProject = options.compactProject === true;
-      const task = options.task || null;
-      const taskToggle = task && task.subagentCount
-        ? `<button class="task-toggle" type="button" data-task-toggle="${escapeHtml(task.key)}" aria-expanded="${task.expanded ? 'true' : 'false'}" aria-label="${escapeHtml(t(task.expanded ? 'collapseTask' : 'expandTask'))}" title="${escapeHtml(t(task.expanded ? 'collapseTask' : 'expandTask'))}"></button>`
-        : '';
-      const taskRowToggle = Boolean(task && task.subagentCount && !selectable);
-      const rowAttributes = [
-        selectable ? `data-uid="${escapeHtml(row.uid)}"` : '',
-        taskRowToggle
-          ? `data-task-toggle-row="${escapeHtml(task.key)}" role="button" tabindex="0" aria-expanded="${task.expanded ? 'true' : 'false'}"`
-          : '',
-      ].filter(Boolean).join(' ');
-      const totalTitle = task
-        ? `${t('taskTotal')}: ${fmt(usage.total_tokens)} tokens`
-        : `${fmt(usage.total_tokens)} tokens`;
-      return `
-        <tr class="${escapeHtml(classes)}"${rowAttributes ? ` ${rowAttributes}` : ''}>
-          <td class="title-cell" title="${escapeHtml((row.title || row.session_id) + (timeValue ? ' · ' + fmtDate(timeValue) : ''))}">
-            <div class="title-line">
-              ${taskToggle}
-              ${compactProject ? sourceBadge(row.source) : ''}
-              ${compactProject ? branchBadge(row) : ''}
-              <div class="title-main">${escapeHtml(row.title || row.session_id)}</div>
-              <div class="title-time">${escapeHtml(fmtRelativeTime(timeValue))}</div>
-            </div>
-            ${compactProject ? '' : `<div class="title-sub">${environmentBadge(row)} ${sourceBadge(row.source)} ${branchBadge(row)} <span class="title-sub-text">${escapeHtml(row.project || shortPath(row.cwd))}</span></div>`}
-          </td>
-          <td class="number" title="${escapeHtml(totalTitle)}"><strong>${fmtCompact(usage.total_tokens)}</strong></td>
-          <td class="number" title="${fmt(usage.output_tokens)} output tokens">${fmtCompact(usage.output_tokens)}</td>
-          <td class="number" title="${escapeHtml(row.price_model_known ? t('priceKnown') : t('priceUnknown'))}">${fmtUsd(row.estimated_cost_usd)}</td>
-          <td class="number">${fmtPercent(row.cached_input_percent)}</td>
-          <td class="number">${fmt(row.turn_count)}</td>
-          <td class="model-cell" title="${escapeHtml(modelLabel(row))}">${escapeHtml(modelLabel(row))}</td>
-          <td class="effort-cell" title="${escapeHtml(row.effort || 'N/A')}">${escapeHtml(row.effort || 'N/A')}</td>
-        </tr>
-      `;
-    }
-
-    function projectHeaderHtml(group) {
-      const expanded = isProjectExpanded(group);
-      const latest = group.rows[0]?.end_at || group.rows[0]?.updated_at || group.rows[0]?.start_at || '';
-      const effortLabel = projectEffortLabel(group);
-      const modelLabelText = modelLabel(group);
-      return `
-        <tr class="project-group-row">
-          <td class="title-cell">
-            <div class="project-title-cell">
-              <button class="project-toggle" type="button" data-project-toggle="${escapeHtml(group.key)}" title="${escapeHtml(t(expanded ? 'collapseProject' : 'expandProject'))}">
-                ${folderIcon()}
-                <span class="project-name" title="${escapeHtml(group.label)}">${escapeHtml(group.label)}</span>
-              </button>
-              ${environmentBadge(group)}
-            </div>
-            <div class="project-meta">
-              <span>${escapeHtml(t('projectConversationCount', { count: fmt(group.rows.length) }))}</span>
-              <span>${escapeHtml(t('projectLatest', { time: fmtRelativeTime(latest) }))}</span>
-            </div>
-          </td>
-          <td class="number project-aggregate-cell project-total-cell" title="${fmt(group.usage.total_tokens)} tokens"><strong>${escapeHtml(fmtCompact(group.usage.total_tokens))}</strong></td>
-          <td class="number project-aggregate-cell" title="${fmt(group.usage.output_tokens)} output tokens">${escapeHtml(fmtCompact(group.usage.output_tokens))}</td>
-          <td class="number project-aggregate-cell" title="${escapeHtml(group.price_model_known ? t('priceKnown') : t('priceUnknown'))}">${escapeHtml(fmtUsd(group.estimated_cost_usd))}</td>
-          <td class="number project-aggregate-cell" title="${escapeHtml(fmtPercent(group.cached_input_percent))}">${escapeHtml(fmtPercent(group.cached_input_percent))}</td>
-          <td class="number project-aggregate-cell" title="${fmt(group.turn_count)} ${escapeHtml(t('turns'))}">${escapeHtml(fmt(group.turn_count))}</td>
-          <td class="model-cell project-aggregate-cell" title="${escapeHtml(modelLabelText)}">${escapeHtml(modelLabelText)}</td>
-          <td class="effort-cell project-aggregate-cell" title="${escapeHtml(group.efforts.join(', ') || 'N/A')}">${escapeHtml(effortLabel)}</td>
-        </tr>
-      `;
-    }
-
-    function projectMoreRowHtml(group, hiddenCount) {
-      const showingAll = isProjectShowingAll(group);
-      const label = showingAll ? t('showFewerTasks') : t('showMoreTasks', { count: fmt(hiddenCount) });
-      return `
-        <tr class="project-more-row">
-          <td colspan="8">
-            <button class="project-more-btn" type="button" data-project-more="${escapeHtml(group.key)}" data-project-more-state="${showingAll ? 'less' : 'more'}">${escapeHtml(label)}</button>
-          </td>
-        </tr>
-      `;
-    }
-
-    function renderProjectTable() {
-      const groups = projectGroups();
-      const sessionCount = groups.reduce((sum, group) => sum + group.rows.length, 0);
-      document.getElementById('resultCount').textContent = t('projectRowCount', { projects: fmt(groups.length), sessions: fmt(sessionCount) });
-      if (!groups.length) {
-        document.getElementById('sessionRows').innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(t('noMatches'))}</td></tr>`;
-        return;
-      }
-
-      document.getElementById('sessionRows').innerHTML = groups.map(group => {
-        const expanded = isProjectExpanded(group);
-        const showingAll = isProjectShowingAll(group);
-        const taskGroups = taskGroupsForRows(group.rows);
-        const visibleGroups = expanded
-          ? (showingAll ? taskGroups : taskGroups.slice(0, projectPreviewLimit))
-          : [];
-        const hiddenCount = Math.max(0, taskGroups.length - projectPreviewLimit);
-        return [
-          projectHeaderHtml(group),
-          ...visibleGroups.map(taskGroup => taskGroupRowsHtml(taskGroup, 'project-session-row', { compactProject: true })),
-          expanded && hiddenCount > 0 ? projectMoreRowHtml(group, hiddenCount) : '',
-        ].join('');
-      }).join('');
-      bindTableInteractions();
-    }
-
-    function toggleTaskGroup(key) {
-      state.taskExpanded[key] = state.taskExpanded[key] !== true;
-      renderAll();
-    }
-
-    function bindTableInteractions() {
-      document.querySelectorAll('#sessionRows tr[data-uid]').forEach(row => {
-        row.addEventListener('click', () => showDetails(row.dataset.uid));
-      });
-      document.querySelectorAll('[data-task-toggle-row]').forEach(row => {
-        row.addEventListener('click', event => {
-          if (event.target.closest('[data-task-toggle]')) return;
-          toggleTaskGroup(row.dataset.taskToggleRow);
-        });
-        row.addEventListener('keydown', event => {
-          if (event.key !== 'Enter' && event.key !== ' ') return;
-          event.preventDefault();
-          toggleTaskGroup(row.dataset.taskToggleRow);
-        });
-      });
-      document.querySelectorAll('[data-project-toggle]').forEach(button => {
-        button.addEventListener('click', event => {
-          event.stopPropagation();
-          const key = button.dataset.projectToggle;
-          state.projectExpanded[key] = state.projectExpanded[key] === false;
-          renderAll();
-        });
-      });
-      document.querySelectorAll('[data-project-more]').forEach(button => {
-        button.addEventListener('click', event => {
-          event.stopPropagation();
-          const key = button.dataset.projectMore;
-          state.projectShowAll[key] = button.dataset.projectMoreState === 'more';
-          renderAll();
-        });
-      });
-      document.querySelectorAll('[data-task-toggle]').forEach(button => {
-        button.addEventListener('click', event => {
-          event.stopPropagation();
-          toggleTaskGroup(button.dataset.taskToggle);
-        });
-      });
-    }
-
-    function clearDetails() {
-      document.getElementById('detailStatus').textContent = t('notSelected');
-      document.getElementById('detailsBody').innerHTML = `<div class="empty">${escapeHtml(t('selectRow'))}</div>`;
-    }
-
-    async function showDetails(uid, renderRows = true) {
-      state.selectedUid = uid;
-      const requestedToken = state.snapshotToken;
-      if (renderRows) renderTable();
-      document.getElementById('detailStatus').textContent = t('detailsLoading');
-      try {
-        const params = periodParams();
-        params.set('id', uid);
-        if (requestedToken) params.set('snapshot_token', requestedToken);
-        const res = await fetch('/api/session?' + params.toString(), { cache: 'no-store' });
-        if (res.status === 409) {
-          if (state.snapshotToken !== requestedToken || state.selectedUid !== uid) return;
-          const stale = await res.json().catch(() => ({}));
-          if (stale.code === 'snapshot_stale' && state.staleReloadToken !== requestedToken) {
-            state.staleReloadToken = requestedToken;
-            void loadData(false);
-            return;
-          }
-        }
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const detail = await res.json();
-        if (state.snapshotToken !== requestedToken || state.selectedUid !== uid) return;
-        renderDetails(detail);
-      } catch (err) {
-        if (state.snapshotToken !== requestedToken || state.selectedUid !== uid) return;
-        document.getElementById('detailsBody').innerHTML = `<div class="error">${escapeHtml(t('detailFailed', { message: err.message }))}</div>`;
-        document.getElementById('detailStatus').textContent = t('failed');
-      }
-    }
-
-    function renderDetails(detail) {
-      const usage = usageOf(detail);
-      const taskGroup = taskGroupForUid(detail.uid);
-      const taskSummary = taskGroup && taskGroup.root.uid === detail.uid && taskGroup.subagentCount
-        ? taskGroup.displayRow
-        : null;
-      const cacheWriteTokens = Math.max(0, Number(usage.cache_write_tokens || 0));
-      const uncachedInputTokens = Math.max(
-        0,
-        Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0) - cacheWriteTokens,
-      );
-      const costs = detail.estimated_cost_breakdown_usd || {};
-      const priceSegments = Array.isArray(detail.applied_price_segments) ? detail.applied_price_segments : [];
-      const max = Math.max(1, uncachedInputTokens, usage.cached_input_tokens || 0, cacheWriteTokens, usage.output_tokens || 0, usage.reasoning_output_tokens || 0);
-      const toolRows = Object.entries(detail.tool_counts || {}).slice(0, 8).map(([name, count]) =>
-        `<tr><td>${escapeHtml(name)}</td><td class="number">${fmt(count)}</td></tr>`
-      ).join('');
-      const timelineRows = [...(detail.timeline || [])].sort((a, b) => {
-        return new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime();
-      }).map((row) => {
-        const last = row.last_token_usage || {};
-        return `
-          <tr>
-            <td title="${escapeHtml(fmtDate(row.timestamp))}">${escapeHtml(fmtRelativeTime(row.timestamp))}</td>
-            <td class="number">${fmt(last.total_tokens)}</td>
-            <td class="number">${fmt(last.input_tokens)}</td>
-            <td class="number">${fmt(last.cached_input_tokens)}</td>
-            <td class="number">${fmt(last.cache_write_tokens)}</td>
-            <td class="number">${fmt(last.output_tokens)}</td>
-            <td class="number">${fmt(last.reasoning_output_tokens)}</td>
-          </tr>
-        `;
-      }).join('');
-
-      document.getElementById('detailStatus').textContent = t('countEvents', { count: fmt(detail.token_event_count) });
-      document.getElementById('detailsBody').innerHTML = `
-        <div class="detail-title">${escapeHtml(detail.title || detail.session_id)}</div>
-        <div class="detail-badges">${environmentBadge(detail)} ${sourceBadge(detail.source)} ${detail.is_subagent ? `<span class="badge">${escapeHtml(t('subagent'))}</span>` : ''} ${modelBadges(detail)} <span class="badge">${escapeHtml(t('turnSuffix', { count: fmt(detail.turn_count) }))}</span></div>
-
-        ${taskSummary ? `
-          <div class="task-detail-summary">
-            <div class="task-detail-summary-label">${escapeHtml(t('taskTotal'))}</div>
-            <div class="task-detail-summary-value">${escapeHtml(fmtCompact(taskSummary.total_token_usage?.total_tokens || 0))}</div>
-            <div class="task-detail-summary-meta">${escapeHtml([
-              `${fmt(taskSummary.total_token_usage?.total_tokens || 0)} ${t('totalTokens')}`,
-              t('turnSuffix', { count: fmt(taskSummary.turn_count || 0) }),
-              `${t('cost')} ${fmtUsd(taskSummary.estimated_cost_usd)}`,
-            ].join(' · '))}</div>
-          </div>
-        ` : ''}
-        <div class="breakdown">
-          ${breakdownRow(t('input'), 'input', uncachedInputTokens, max, costs.input_tokens, unitPriceTooltip(priceSegments, 'input_tokens'))}
-          ${breakdownRow(t('cached'), 'cached', usage.cached_input_tokens, max, costs.cached_input_tokens, unitPriceTooltip(priceSegments, 'cached_input_tokens'))}
-          ${cacheWriteTokens ? breakdownRow(t('cacheWrite'), 'cache-write', cacheWriteTokens, max, costs.cache_write_tokens, unitPriceTooltip(priceSegments, 'cache_write_tokens')) : ''}
-          ${breakdownRow(t('output'), 'output', usage.output_tokens, max, costs.output_tokens, unitPriceTooltip(priceSegments, 'output_tokens'))}
-          ${breakdownRow(t('reasoning'), 'reasoning', usage.reasoning_output_tokens, max, costs.reasoning_output_tokens, unitPriceTooltip(priceSegments, 'reasoning_output_tokens', t('reasoningCostTitle')))}
-        </div>
-
-        <div class="section-label">${escapeHtml(t('cumulativeChart'))}</div>
-        <canvas id="timelineCanvas" width="720" height="220"></canvas>
-
-        <div class="section-label">${escapeHtml(t('metadata'))}</div>
-        <div class="detail-meta">
-          ${kv(t('totalTokens'), fmt(usage.total_tokens))}
-          ${kv(t('cost'), fmtUsd(detail.estimated_cost_usd))}
-          ${kv(t('cachePercent'), detail.cached_input_percent == null ? '' : detail.cached_input_percent + '%')}
-          ${kv(t('reasoningEffort'), detail.effort || 'N/A')}
-          ${kv(t('time'), `${fmtRelativeTime(detail.end_at)} (${fmtDate(detail.start_at)} - ${fmtDate(detail.end_at)})`)}
-          ${kv(t('totalDuration'), fmtDuration(detail.duration_ms_total))}
-          ${kv(t('ttftAvg'), fmtDuration(detail.time_to_first_token_ms_avg))}
-          ${kv(t('environment'), detail.environment || '')}
-          ${kv(t('project'), detail.project || '')}
-          ${kv(t('projectRoot'), detail.project_root || '', 'path')}
-          ${detail.is_git_worktree ? kv(t('workspaceRoot'), detail.workspace_root || '', 'path') : ''}
-          ${detail.project_branch ? kv(t('branch'), detail.project_branch || '') : ''}
-          ${kv(t('cwd'), detail.cwd || '', 'path')}
-          ${kv(t('codexHome'), detail.codex_home || '', 'path')}
-          ${kv(t('logFile'), detail.path || '', 'path')}
-          ${kv('Session ID', detail.session_id || '', 'path')}
-          ${detail.is_subagent ? kv(t('threadType'), t('subagent')) : ''}
-          ${detail.parent_thread_id ? kv(t('parentThread'), detail.parent_thread_id, 'path') : ''}
-          ${detail.is_subagent ? kv(t('inheritedTokens'), fmt(detail.inherited_token_usage?.total_tokens || 0)) : ''}
-          ${detail.is_subagent ? kv(t('branchTotalTokens'), fmt(detail.branch_total_token_usage?.total_tokens || 0)) : ''}
-          ${detail.is_subagent && detail.fork_usage_resolved === false ? kv(t('forkBaselineStatus'), t('forkBaselineUnresolved')) : ''}
-        </div>
-
-        ${detail.first_user_prompt ? `<div class="section-label">${escapeHtml(t('firstUserPrompt'))}</div><div class="notice">${escapeHtml(detail.first_user_prompt)}</div>` : ''}
-        ${detail.last_agent_preview ? `<div class="section-label">${escapeHtml(t('lastReplySummary'))}</div><div class="notice">${escapeHtml(detail.last_agent_preview)}</div>` : ''}
-
-        <div class="section-label">${escapeHtml(t('toolCalls'))}</div>
-        ${toolRows ? `<table class="mini-table"><thead><tr><th>${escapeHtml(t('tool'))}</th><th>${escapeHtml(t('count'))}</th></tr></thead><tbody>${toolRows}</tbody></table>` : `<div class="notice">${escapeHtml(t('noToolCalls'))}</div>`}
-
-        <div class="section-label">${escapeHtml(t('timelineDetails'))}</div>
-        ${timelineRows ? `<div class="table-wrap" style="max-height:260px"><table class="mini-table timeline-table"><thead><tr><th>${escapeHtml(t('timelineTime'))}</th><th>${escapeHtml(t('timelineTotal'))}</th><th>${escapeHtml(t('input'))}</th><th>${escapeHtml(t('cached'))}</th><th>${escapeHtml(t('cacheWrite'))}</th><th>${escapeHtml(t('output'))}</th><th>${escapeHtml(t('reasoning'))}</th></tr></thead><tbody>${timelineRows}</tbody></table></div>` : `<div class="notice">${escapeHtml(t('noTimeline'))}</div>`}
-      `;
-      drawTimeline(detail.timeline || []);
-    }
-
-    function segmentTokenCount(segment, usageKey) {
-      const usage = segment && segment.usage ? segment.usage : {};
-      if (usageKey === 'input_tokens') {
-        return Math.max(0, Number(usage.input_tokens || 0) - Number(usage.cached_input_tokens || 0) - Number(usage.cache_write_tokens || 0));
-      }
-      return Math.max(0, Number(usage[usageKey] || 0));
-    }
-
-    function unitPriceTooltip(segments, usageKey, baseTitle = '') {
-      const rateKey = {
-        input_tokens: 'input',
-        cached_input_tokens: 'cached_input',
-        cache_write_tokens: 'cache_write_input',
-        output_tokens: 'output',
-        reasoning_output_tokens: 'output',
-      }[usageKey];
-      const lines = (segments || []).flatMap(segment => {
-        const tokens = segmentTokenCount(segment, usageKey);
-        const rawPrice = segment?.prices?.[rateKey]
-          ?? (usageKey === 'cache_write_tokens' ? segment?.prices?.input : undefined);
-        const price = Number(rawPrice);
-        if (!tokens || !Number.isFinite(price)) return [];
-        const tier = segment.context_tier === 'long'
-          ? t('priceLongContext')
-          : (segment.context_tier === 'short' ? t('priceShortContext') : '');
-        return [t('unitPriceSegment', {
-          model: `${segment.model || 'unknown'}${tier}`,
-          price: fmtUsdRate(price),
-          tokens: fmt(tokens),
-        })];
-      });
-      return [baseTitle, ...lines].filter(Boolean).join(String.fromCharCode(10));
-    }
-
-    function breakdownRow(label, cls, value, max, cost, title = '') {
-      const pct = Math.max(2, Math.round(Number(value || 0) / max * 100));
-      const costText = fmtUsd(cost);
-      const costAttrs = title
-        ? ` class="price-tooltip-trigger" tabindex="0" title="${escapeHtml(title)}" aria-label="${escapeHtml(`${label}: ${costText}. ${title.split(String.fromCharCode(10)).join('. ')}`)}"`
-        : '';
-      return `
-        <div class="breakdown-row">
-          <div>${escapeHtml(label)}</div>
-          <div class="bar-track"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
-          <div class="breakdown-value"><span>${fmt(value)}</span><strong${costAttrs}>${costText}</strong></div>
-        </div>
-      `;
-    }
-
-    function kv(label, value, cls = '') {
-      return `<div class="kv"><span>${escapeHtml(label)}</span><strong class="${cls}">${escapeHtml(value || '')}</strong></div>`;
-    }
-
-    function drawTimeline(timeline) {
-      const canvas = document.getElementById('timelineCanvas');
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.max(320, Math.floor(rect.width * dpr));
-      canvas.height = Math.floor(150 * dpr);
-      const ctx = canvas.getContext('2d');
-      ctx.scale(dpr, dpr);
-      const width = canvas.width / dpr;
-      const height = canvas.height / dpr;
-      ctx.clearRect(0, 0, width, height);
-      ctx.fillStyle = '#fbfcfc';
-      ctx.fillRect(0, 0, width, height);
-      ctx.strokeStyle = '#d9dfdd';
-      ctx.lineWidth = 1;
-      for (let i = 1; i <= 3; i++) {
-        const y = Math.round((height / 4) * i);
-        ctx.beginPath();
-        ctx.moveTo(10, y);
-        ctx.lineTo(width - 10, y);
-        ctx.stroke();
-      }
-
-      const points = timeline.map(row => Number(row.total_token_usage?.total_tokens || 0));
-      if (!points.length) {
-        ctx.fillStyle = '#65716c';
-        ctx.fillText(t('noCurve'), 14, 24);
-        return;
-      }
-      const max = Math.max(1, ...points);
-      const min = Math.min(0, ...points);
-      const span = Math.max(1, max - min);
-      const left = 12;
-      const right = width - 12;
-      const top = 12;
-      const bottom = height - 22;
-      ctx.strokeStyle = '#0f7b63';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      points.forEach((value, index) => {
-        const x = points.length === 1 ? left : left + (right - left) * index / (points.length - 1);
-        const y = bottom - (bottom - top) * (value - min) / span;
-        if (index === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
-      ctx.fillStyle = '#17201d';
-      ctx.font = '12px system-ui, sans-serif';
-      ctx.fillText(fmtCompact(max), 14, 18);
-      ctx.fillStyle = '#65716c';
-      ctx.fillText(t('countPoints', { count: points.length }), 14, height - 8);
-    }
-
-    function updateRemoteButton() {
-      const button = document.getElementById('remoteBtn');
-      if (!button) return;
-      button.textContent = state.remotes.length ? t('manageRemote') : t('importRemote');
-      button.title = t('importRemoteTitle');
-    }
-
-    function openRemoteModal() {
-      renderRemoteModal();
-      document.getElementById('remoteModal').hidden = false;
-    }
-
-    function closeRemoteModal() {
-      document.getElementById('remoteModal').hidden = true;
-      state.pendingRemoteSnapshot = null;
-    }
-
-    function remoteStatus(message = '', isError = false) {
-      const el = document.getElementById('remoteStatus');
-      if (!el) return;
-      el.textContent = message;
-      el.classList.toggle('error-text', isError);
-    }
-
-    function renderRemoteModal(status = '') {
-      const body = document.getElementById('remoteModalBody');
-      const rows = state.remotes || [];
-      const table = rows.length ? `
-        <table class="remote-table">
-          <thead>
-            <tr>
-              <th>${escapeHtml(t('remoteName'))}</th>
-              <th>${escapeHtml(t('remoteCode'))}</th>
-              <th>${escapeHtml(t('remoteSessions'))}</th>
-              <th>${escapeHtml(t('remoteUpdated'))}</th>
-              <th>${escapeHtml(t('remoteImportedAt'))}</th>
-              <th>${escapeHtml(t('remoteActions'))}</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.map(row => `
-              <tr>
-                <td><strong>${escapeHtml(row.label || row.device_short_code)}</strong></td>
-                <td class="path remote-code">${escapeHtml(row.device_short_code || '')}</td>
-                <td class="remote-count">${fmt(row.session_count || 0)}</td>
-                <td class="remote-date">${escapeHtml(fmtDate(row.generated_at || row.exported_at))}</td>
-                <td class="remote-date">${escapeHtml(fmtDate(row.imported_at))}</td>
-                <td class="remote-action-cell">
-                  <div class="remote-actions">
-                    <button type="button" data-remote-update="${escapeHtml(row.device_short_code)}">${escapeHtml(t('remoteUpdate'))}</button>
-                    <button type="button" data-remote-rename="${escapeHtml(row.device_short_code)}">${escapeHtml(t('remoteRename'))}</button>
-                    <button class="danger" type="button" data-remote-delete="${escapeHtml(row.device_short_code)}">${escapeHtml(t('remoteDelete'))}</button>
-                  </div>
-                </td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      ` : `<div class="empty">${escapeHtml(t('remoteEmpty'))}</div>`;
-
-      body.innerHTML = `
-        <div class="status-line">${escapeHtml(t('remoteImportHelp'))}</div>
-        ${table}
-        <div class="status-line" id="remoteStatus">${escapeHtml(status)}</div>
-      `;
-      bindRemoteRows();
-      updateRemoteButton();
-    }
-
-    function bindRemoteRows() {
-      document.querySelectorAll('[data-remote-update]').forEach(button => {
-        button.addEventListener('click', () => chooseRemoteFile());
-      });
-      document.querySelectorAll('[data-remote-rename]').forEach(button => {
-        button.addEventListener('click', () => renameRemote(button.dataset.remoteRename));
-      });
-      document.querySelectorAll('[data-remote-delete]').forEach(button => {
-        button.addEventListener('click', () => deleteRemote(button.dataset.remoteDelete));
-      });
-    }
-
-    function chooseRemoteFile() {
-      const input = document.getElementById('remoteFileInput');
-      input.value = '';
-      input.click();
-    }
-
-    async function readJsonFile(file) {
-      const text = await file.text();
-      return JSON.parse(text);
-    }
-
-    async function importRemoteSnapshot(snapshot, options = {}) {
-      const res = await fetch('/api/remotes/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ snapshot, ...options }),
-      });
-      const data = await res.json();
-      if (res.ok && data.ok) {
-        state.periodCache.clear();
-        state.dailyUsageComplete = false;
-        await loadData(false);
-        renderRemoteModal(t('remoteImported'));
-        document.getElementById('remoteModal').hidden = false;
-        return;
-      }
-      if (data.needs_label) {
-        const label = window.prompt(t('remoteNeedLabel'), data.suggested_label || '');
-        if (!label) {
-          remoteStatus('', false);
-          return;
-        }
-        await importRemoteSnapshot(snapshot, { label });
-        return;
-      }
-      if (data.needs_confirmation && data.reason === 'current_device') {
-        if (window.confirm(t('remoteCurrentWarning'))) {
-          const label = window.prompt(t('remoteNeedLabel'), data.suggested_label || '');
-          await importRemoteSnapshot(snapshot, { allow_current_device: true, label: label || data.suggested_label || '' });
-        }
-        return;
-      }
-      throw new Error(data.error || data.reason || 'unknown');
-    }
-
-    async function handleRemoteFile(file) {
-      if (!file) return;
-      try {
-        remoteStatus(t('loading'));
-        const snapshot = await readJsonFile(file);
-        await importRemoteSnapshot(snapshot);
-      } catch (err) {
-        remoteStatus(t('remoteImportFailed', { message: err.message }), true);
-      }
-    }
-
-    async function renameRemote(deviceCode) {
-      const row = state.remotes.find(item => item.device_short_code === deviceCode);
-      const label = window.prompt(t('remoteName'), row?.label || deviceCode);
-      if (!label) return;
-      try {
-        const res = await fetch('/api/remotes/rename', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_short_code: deviceCode, label }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'unknown');
-        state.periodCache.clear();
-        await loadData(false);
-        renderRemoteModal(t('remoteRenamed'));
-      } catch (err) {
-        remoteStatus(t('remoteImportFailed', { message: err.message }), true);
-      }
-    }
-
-    async function deleteRemote(deviceCode) {
-      if (!window.confirm(t('remoteDeleteConfirm'))) return;
-      try {
-        const res = await fetch('/api/remotes/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_short_code: deviceCode, confirm: true }),
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || 'unknown');
-        state.periodCache.clear();
-        state.dailyUsageComplete = false;
-        await loadData(false);
-        renderRemoteModal(t('remoteDeleted'));
-      } catch (err) {
-        remoteStatus(t('remoteImportFailed', { message: err.message }), true);
-      }
-    }
-
-    document.getElementById('refreshBtn').addEventListener('click', () => loadData(false));
-    document.getElementById('remoteBtn').addEventListener('click', () => {
-      if (state.remotes.length) openRemoteModal();
-      else chooseRemoteFile();
-    });
-    document.getElementById('remoteImportBtn').addEventListener('click', chooseRemoteFile);
-    document.getElementById('remoteCloseBtn').addEventListener('click', closeRemoteModal);
-    document.getElementById('remoteModal').addEventListener('click', event => {
-      if (event.target.id === 'remoteModal') closeRemoteModal();
-    });
-    document.getElementById('remoteFileInput').addEventListener('change', event => {
-      handleRemoteFile(event.target.files && event.target.files[0]);
-    });
-    document.getElementById('snapshotExportBtn').addEventListener('click', () => { window.location.href = '/api/export.json'; });
-    document.getElementById('searchInput').addEventListener('input', event => { state.search = event.target.value; renderAll(); });
-    document.getElementById('environmentFilter').addEventListener('change', event => { state.environment = event.target.value; renderAll(); });
-    document.getElementById('sourceFilter').addEventListener('change', event => { state.source = event.target.value; renderAll(); });
-    document.getElementById('modelFilter').addEventListener('change', event => { state.model = event.target.value; renderAll(); });
-    document.querySelectorAll('[data-lang-button]').forEach(button => {
-      button.addEventListener('click', () => setLanguage(button.dataset.langButton));
-    });
-    document.querySelectorAll('[data-period-button]').forEach(button => {
-      button.addEventListener('click', () => setPeriod(button.dataset.periodButton));
-    });
-    document.getElementById('periodWrap').addEventListener('click', event => {
-      event.stopPropagation();
-    });
-    document.getElementById('calendarBtn').addEventListener('click', event => {
-      event.stopPropagation();
-      if (state.calendarOpen) closeCalendar();
-      else openCalendar();
-    });
-    document.querySelectorAll('[data-view-button]').forEach(button => {
-      button.addEventListener('click', () => setPrimaryView(button.dataset.viewButton));
-    });
-    document.getElementById('limitSelect').addEventListener('change', event => { state.limit = event.target.value; renderAll(); });
-    document.querySelectorAll('th[data-sort]').forEach(th => {
-      th.addEventListener('click', () => {
-        const key = th.dataset.sort;
-        state.viewMode = key === 'total_tokens' ? 'total' : 'recent';
-        if (state.sortKey === key) state.sortDir = state.sortDir === 'desc' ? 'asc' : 'desc';
-        else { state.sortKey = key; state.sortDir = 'desc'; }
-        renderAll();
-      });
-    });
-    window.addEventListener('resize', () => {
-      if (state.selectedUid) showDetails(state.selectedUid, false);
-    });
-    document.addEventListener('click', event => {
-      if (state.calendarOpen && !event.target.closest('#periodWrap')) closeCalendar();
-    });
-    document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && state.calendarOpen) closeCalendar();
-    });
-
-    applyStaticText();
-    populateEnvironmentFilter();
-    populateSourceFilter();
-    populateLimitSelect();
-    loadData(true);
-    setInterval(() => loadData(false, { silent: true }), 10000);
-  </script>
-</body>
-</html>
-"""
+def load_sibling_module(name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + ".py"))
+    if spec is None or spec.loader is None:
+        raise ImportError(name)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+HTML = load_sibling_module("session_analysis_ui").HTML
+_inspect = load_sibling_module("session_inspect")
 
 
 def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
+    inspector = _inspect.SessionInspector(read_rollout_jsonl)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "CodexUsageDashboard/1.0"
 
@@ -6868,6 +4073,49 @@ def make_handler(analyzer: CodexUsageAnalyzer) -> type[BaseHTTPRequestHandler]:
                         "device_short_code": analyzer.remote_store.current_device_code if analyzer.remote_store else current_device_short_code(),
                     }
                 )
+                return
+
+            if path.startswith("/api/analysis/"):
+                try:
+                    snapshot_token = query.get("snapshot_token", [""])[0] or None
+                    if path != "/api/analysis/sessions" and not snapshot_token:
+                        raise ValueError("snapshot_token is required; refresh the session list")
+                    snapshot = analyzer.analysis_snapshot(snapshot_token if path != "/api/analysis/sessions" else None)
+                    analysis = snapshot["analysis"]
+                    if path == "/api/analysis/sessions":
+                        self.send_json({"snapshot_token": snapshot["snapshot_token"], "generated_at": snapshot["generated_at"], "roots": analysis["roots"]})
+                        return
+                    root_id = query.get("id", [""])[0]
+                    if root_id not in analysis["usages"]:
+                        self.send_json({"error": "conversation not found"}, status=404)
+                        return
+                    if path == "/api/analysis/usage":
+                        self.send_json(analysis["usages"][root_id])
+                        return
+                    threads = analysis["sources"][root_id]
+                    if path == "/api/analysis/events":
+                        result = inspector.events(root_id, snapshot["snapshot_token"], threads,
+                            agent_id=query.get("agent_id", [""])[0], category=query.get("category", [""])[0],
+                            offset=int(query.get("offset", ["0"])[0]), limit=int(query.get("limit", ["100"])[0]))
+                        self.send_json(result)
+                        return
+                    if path == "/api/analysis/event":
+                        result = inspector.event(root_id, snapshot["snapshot_token"], threads, query.get("event_id", [""])[0])
+                        if result is None:
+                            self.send_json({"error": "event not found"}, status=404)
+                        else:
+                            self.send_json(result)
+                        return
+                except (SnapshotStaleError, _inspect.InspectSourceChanged):
+                    self.send_json({"error": "snapshot stale", "code": "snapshot_stale"}, status=409)
+                    return
+                except (ValueError, _inspect.InspectBadRequest) as exc:
+                    self.send_json({"error": str(exc)}, status=400)
+                    return
+                except KeyError:
+                    self.send_json({"error": "event not found"}, status=404)
+                    return
+                self.send_json({"error": "not found"}, status=404)
                 return
 
             if path == "/api/sessions":
@@ -7165,7 +4413,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not auto-add the Windows ~/.codex directory when running under WSL.",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to 127.0.0.1.")
+    parser.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1",), help="Local bind host (127.0.0.1).")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind. Defaults to the fixed dashboard port 8765.")
     parser.add_argument(
         "--parse-workers",

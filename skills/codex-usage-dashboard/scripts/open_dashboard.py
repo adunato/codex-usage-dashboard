@@ -52,33 +52,7 @@ def health_dashboard_url(port: int) -> str | None:
         isinstance(payload, dict)
         and payload.get("app") == "codex-usage-dashboard"
         and isinstance(features, list)
-        and "calendar-range-v2" in features
-        and "multi-codex-home" in features
-        and "windows-cwd-folder-name" in features
-        and "project-grouped-default-view" in features
-        and "project-compact-layout-v2" in features
-        and "project-env-tag-in-conversation-column" in features
-        and "git-worktree-project-grouping" in features
-        and "remote-snapshot-import-v1" in features
-        and "effective-dated-pricing-v1" in features
-        and "bounded-period-scan-v1" in features
-        and "fork-aware-subagent-usage-v1" in features
-        and "expandable-agent-task-rollups-v1" in features
-        and "compact-agent-task-tree-v1" in features
-        and "aligned-agent-task-tree-v1" in features
-        and "main-agent-child-usage-row-v1" in features
-        and "aligned-task-title-gutter-v1" in features
-        and "project-session-indent-v1" in features
-        and "clickable-task-rows-and-gutter-v1" in features
-        and "main-agent-title-alignment-v1" in features
-        and "compact-subagent-indent-v1" in features
-        and "project-folder-aggregate-columns-v1" in features
-        and "filtered-summary-metrics-v1" in features
-        and "fast-rollout-projection-v1" in features
-        and "snapshot-detail-token-v1" in features
-        and "persistent-parse-cache-v1" in features
-        and "append-resume-v1" in features
-        and "parallel-cold-parse-v1" in features
+        and "session-analysis-v1" in features
     ):
         return url
     return None

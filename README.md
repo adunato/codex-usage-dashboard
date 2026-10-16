@@ -2,18 +2,17 @@
 
 Codex-only skill for a local OpenAI Codex usage dashboard.
 
-It reads your local Codex session logs and opens a browser dashboard for per-conversation usage: total tokens, output tokens, estimated dollar cost, cache hit rate, turns, model, reasoning effort, tool calls, and token-count timeline. It can also import JSON snapshots exported from other devices, so each machine can show local realtime usage plus manually imported remote usage.
+A local browser for Codex conversations: find a root conversation, see where its recorded tokens were spent, and inspect the original events from Main and its agent threads. Runs with Python 3 and no API key.
 
 > Currently only supports OpenAI Codex. It is not a Claude Code, Cursor, Continue, or generic OpenAI API dashboard.
-<img width="1830" height="1041" alt="Codex Usage Dashboard project view" src="assets/codex-usage-dashboard.png" />
 
-## Why This Exists
+## Three screens
 
-Most usage tools show daily or project-level totals. This dashboard focuses on the thing Codex users often want to know:
+- **Sessions** lists one row per root conversation, including archived conversations and associated agents. Search by title or project; sort by newest or total tokens.
+- **Usage** shows overall Input, Cached input, Output and Total, expandable totals by recorded agent role, individual threads, and totals by the model used for each token contribution. Cached input is already included in input; reasoning output is already included in output.
+- **Inspect** inventories the records actually present and displays a chronological timeline. Filter by agent or event category, then expand messages, tool arguments/results, or readable reasoning summaries. Expanded events show their original filename, thread ID and line number. Large content loads on expansion and is explicitly marked if truncated.
 
-**Which Codex conversation used the most?**
-
-It shows a searchable conversation list and a detail view for each session, including the cost split for input, cached input, output, and reasoning tokens.
+**Complete** means all usage available in the inspected logs was counted and attributed. It does not guarantee that Codex recorded every internal request. **Incomplete** shows known totals with explanations for missing logs, unresolved inherited counters or inconsistent accounting. Unidentified historical roles and models appear as **Unknown**.
 
 ## Install With The Skills CLI
 
@@ -47,23 +46,6 @@ Install and open immediately:
 npx github:luyh7/codex-usage-dashboard -- --open
 ```
 
-## Features
-
-- Per-conversation Codex usage from local session logs.
-- Default project view, grouped by environment and workspace, with switches for recent and total-token list views.
-- Expandable main-agent task rows that show the combined usage of the main agent and its subagents, with nested subagent detail on demand.
-- Compact list columns for total tokens, output tokens, cost, cache hit rate, turns, model, and reasoning effort.
-- Detail view with token breakdown, estimated dollar cost, and hoverable unit prices for input, cached input, cache writes, output, and reasoning.
-- Effective-dated pricing with per-request GPT-5.6 short/long context tiers, so earlier usage is not repriced when a new model launches.
-- Fork-aware subagent accounting: inherited parent history is removed from child totals, costs, and timelines instead of being counted again.
-- Token-count timeline with latest entries shown first.
-- Tool call counts, project path, log file path, and session metadata.
-- Local and read-only: reads Codex session logs from one or more local Codex homes; does not modify Codex logs.
-- Manual multi-device snapshots: export `cousash-<device-short-code>.json` from one device and import it into another dashboard as remote data.
-- WSL + Windows support: when running in WSL, automatically merges WSL `~/.codex` with Windows `/mnt/c/Users/<you>/.codex` when present.
-- Cross-platform: works on Windows and macOS with Python 3.
-- No API key required.
-
 ## What Gets Installed
 
 The standard skills CLI installs:
@@ -84,6 +66,8 @@ skills/
     scripts/open_dashboard.py
     scripts/export_snapshot.py
     scripts/codex_usage_dashboard.py
+    scripts/session_analysis_ui.py
+    scripts/session_inspect.py
     scripts/install_desktop_shortcut.py
     assets/codex_usage_dashboard.ico
 ```
@@ -116,21 +100,13 @@ Open the dashboard on the receiving device:
 python ~/.codex/skills/codex-usage-dashboard/scripts/open_dashboard.py
 ```
 
-Export a snapshot on another device from the dashboard's **Export Snapshot** button, or run:
+Export a snapshot on another device with:
 
 ```bash
 python ~/.codex/skills/codex-usage-dashboard/scripts/export_snapshot.py
 ```
 
-The export command writes a JSON file named like:
-
-```text
-cousash-mac-9f3a72c1.json
-```
-
-In the dashboard, use **Import Remote Data** to import that JSON file. The device short code is stored inside the file and is used as the stable identity. Re-importing a newer file from the same device updates that remote data incrementally by session id. If there is no matching remote device yet, the dashboard asks for a display name.
-
-Imported remote snapshots are stored outside the skill directory in the user's application config directory, so reinstalling the skill does not remove them. Remote data can be renamed or deleted from **Manage Remote Data**; deletion is permanent.
+The existing snapshot export/import APIs remain available for manual usage summaries. Imported summaries can contribute token data, but they do not contain original transcripts. Inspect says **Full session history not available on this device** when the original local logs are absent. The session browser does not automatically synchronize devices.
 
 To force specific log roots, pass `--codex-home` one or more times:
 
@@ -156,7 +132,7 @@ Under WSL, the default scan also includes:
 /mnt/c/Users/<you>/.codex/archived_sessions
 ```
 
-It parses Codex `token_count` events, including `total_token_usage`, `last_token_usage`, model context window, task timing, and tool calls.
+It parses cumulative Codex `token_count` events and newer `token_usage_record` records through the same accounting pipeline. Overlapping counters are deduplicated, inherited parent usage is removed where the logs permit it, and model changes are attributed at the time of consumption. Inspect uses the shared JSONL reader and retrieves original records on demand.
 
 ## Privacy
 
@@ -164,11 +140,18 @@ This is a local dashboard. It does not upload your Codex logs. It starts a local
 
 ## Limitations
 
-- Codex-only: designed for OpenAI Codex Desktop/CLI local session logs.
-- Cost is an estimate from public standard API prices and may not match ChatGPT/Codex subscription billing.
-- `codex-auto-review` is shown as $0.00 by dashboard convention; this is not a public API unit price.
-- Automatic remote syncing across machines is not included. Multi-device support is manual export/import. WSL + Windows works on the same machine when the Windows profile is mounted under `/mnt/c`.
+- Codex Desktop/CLI JSONL formats vary. Unsupported records remain visible by raw type; missing or inconsistent accounting is flagged.
+- Encrypted reasoning remains unavailable. Readable summaries are shown only when recorded; this app does not recover hidden thinking or infer unrecorded actions.
+- Tool calls/results pair using recorded call IDs within each thread. Missing or ambiguous matches are shown explicitly.
+- Timestamp ordering across threads is chronological, without a claim of causality. Equal timestamps retain file order.
+- Source logs can change while a conversation is active. Refresh the session list if an old snapshot becomes unavailable.
+- Large expanded content is bounded and visibly marked when truncated. Original session files remain unchanged.
+- No AI scoring, efficiency recommendations, new pricing system, or automatic remote uploads are included.
 
-## Keywords
+## Development checks
 
-OpenAI Codex usage dashboard, Codex token usage, Codex per conversation usage, Codex session usage, Codex output tokens, Codex cache hit rate, Codex cost estimate, Codex local logs, Codex skill, OpenAI Codex skill.
+```bash
+python -m unittest discover -s tests
+python -m compileall -q scripts tests skills
+npm run validate
+```
