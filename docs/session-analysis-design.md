@@ -1,8 +1,8 @@
 # Codex Session Analysis — Functional Specification and Build Plan
 
-**Repository:** `adunato/codex-usage-dashboard`  
-**Target:** Replace/simplify the existing dashboard where useful; do not preserve unwanted UI or design decisions.  
-**Reference configuration:** `adunato/codex-config`, branch `change/flat-agent-routing` (for role names only).  
+**Repository:** `adunato/codex-usage-dashboard`
+**Target:** Replace/simplify the existing dashboard where useful; do not preserve unwanted UI or design decisions.
+**Reference configuration:** `adunato/codex-config`, branch `change/flat-agent-routing` (for role names only).
 **Status:** Design, not implemented.
 
 ## 1. What we are building

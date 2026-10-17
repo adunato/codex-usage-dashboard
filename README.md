@@ -16,10 +16,12 @@ A local browser for Codex conversations: find a root conversation, see where its
 
 ## Windows: double-click to start and stop
 
-Open the `skills/codex-usage-dashboard` folder (or the installed skill folder) in File Explorer:
+Open the project folder in File Explorer:
 
-- Double-click **Start Dashboard.bat** to start the local dashboard and open your browser.
-- Double-click **Stop Dashboard.bat** to stop dashboard servers. Running it again is safe.
+- Double-click **Start Codex Dashboard.bat** to start the local dashboard and open your browser.
+- Double-click **Stop Codex Dashboard.bat** to stop dashboard servers. Running it again is safe.
+
+These project buttons use the scripts inside `skills/codex-usage-dashboard/scripts`. An installed skill also includes **Start Dashboard.bat** and **Stop Dashboard.bat** in its own folder.
 
 No terminal commands or open Codex app are needed. Closing the browser does not stop the server; use the Stop file. Both files find an installed Python 3 interpreter and show a readable error if it is unavailable.
 

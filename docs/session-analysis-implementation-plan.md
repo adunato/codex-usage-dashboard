@@ -71,4 +71,3 @@ No user decision is required. Fixed-byte local inspection confirmed that modern 
 - [x] Implement Sessions, Usage and Inspect browser screens.
 - [x] Update README and verify installed launcher.
 - [x] Complete focused and regression checks, local-log demonstration and change handoff.
-

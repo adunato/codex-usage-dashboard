@@ -187,4 +187,3 @@ Describe the three-screen workflow, root grouping, role/agent/model accounting, 
 The main risks are unresolved modern usage overlap, historical fork baselines, duplicate resumed sources, live-file mutation and oversized payloads. These are handled with canonical observations, retained known amounts, explicit incompleteness, pinned source checks and bounded expansions. No outstanding user decision is required. A substantive contradiction with focused new evidence returns to Main; workers must not silently redefine totals or JSON contracts.
 
 Acceptance requires the implementation-plan checks, reconciliation and source/security tests above, all existing regressions, direct/installed launcher compatibility, and a working multi-agent Usage → Inspect browser demonstration on actual local logs. Design work performed only reads/templates and writes these two design documents; it does not claim implementation tests have run.
-

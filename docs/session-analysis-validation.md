@@ -27,3 +27,9 @@ Review corrections included preserving undated known usage, validating all cumul
 No archived local rollout was available for a real-log demonstration; archived discovery is covered by synthetic fixtures. The symlink creation test remains unexecuted on this host because of Windows privileges; containment checks and source mutation/replacement tests pass. Large expanded records are visibly bounded at 200,000 characters. Unsupported or conflicting accounting remains explicitly Incomplete.
 
 No additional manual validation is required.
+
+## Local main integration — 17 October 2026
+
+The implementation branch was fast-forwarded into the primary local main checkout. The existing local SQLite identity patch was verified in full as already included in the integrated source. Root Start/Stop batch files now invoke only project-local scripts; their quoting, relative paths and browser-opening behavior passed harmless stub checks without starting the dashboard or opening a browser.
+
+Validation from the primary main checkout: 92 tests run, 91 passed and one skipped for Windows symlink privileges; Python compileall, installer syntax and whitespace checks passed. Synthetic HTTP fixtures cover all analysis endpoints and the English Sessions/Usage/Inspect interface. No persistent dashboard server was launched or restarted for this integration, and the separate AppData application copy was not accessed.
