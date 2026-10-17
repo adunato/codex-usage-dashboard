@@ -1,5 +1,6 @@
 @echo off
 setlocal
+set "CODEX_DASHBOARD_NO_BROWSER=1"
 cd /d "%~dp0"
 if defined CODEX_DASHBOARD_PYTHON goto run_pinned
 set "PYTHON="
@@ -25,5 +26,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+start "" "http://127.0.0.1:8765/"
 timeout /t 3 /nobreak >nul 2>&1
 exit /b 0

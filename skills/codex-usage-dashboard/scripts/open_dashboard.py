@@ -72,6 +72,8 @@ def windows_pythonw() -> str:
 
 
 def open_browser(url: str) -> None:
+    if os.environ.get("CODEX_DASHBOARD_NO_BROWSER") == "1":
+        return
     try:
         webbrowser.open(url, new=2)
     except Exception:
